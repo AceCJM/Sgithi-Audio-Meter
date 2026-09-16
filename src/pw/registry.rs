@@ -2,7 +2,7 @@
 //! `Event`s, and dispatches `Command`s that need a live proxy (Node volume/mute, Metadata
 //! default sink/source) or the registry itself (link create/destroy).
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
@@ -81,10 +81,6 @@ fn get_u32(props: Option<&DictRef>, key: &str) -> Option<u32> {
     props.and_then(|p| p.get(key)).and_then(|v| v.parse().ok())
 }
 
-fn get_i32(props: Option<&DictRef>, key: &str) -> Option<i32> {
-    props.and_then(|p| p.get(key)).and_then(|v| v.parse().ok())
-}
-
 /// Handle a newly discovered registry global. Binds a proxy for Node/Metadata (needed to send
 /// commands to them later); Port/Link/Factory are read straight from their global properties.
 pub fn handle_global(state: &Rc<RefCell<PwState>>, obj: &pipewire::registry::GlobalObject<&DictRef>) {
@@ -96,11 +92,11 @@ pub fn handle_global(state: &Rc<RefCell<PwState>>, obj: &pipewire::registry::Glo
             let hardware = is_hardware(&media_class);
             let name = get(obj.props, *keys::NODE_NAME).unwrap_or_else(|| format!("node-{}", obj.id));
             let description = get(obj.props, *keys::NODE_DESCRIPTION);
-            let route_link = if hardware {
-                get_u32(obj.props, *keys::DEVICE_ID).zip(get_i32(obj.props, "card.profile.device"))
-            } else {
-                None
-            };
+            // `device.id` is present in the registry's initial `global` properties, but
+            // `card.profile.device` (the other half of a route link - see device_route.rs) is
+            // NOT; it's only delivered later via the bound Node's `info` event. So the route link
+            // can only be resolved once that first `info` event arrives, not at discovery time.
+            let device_id_hint = if hardware { get_u32(obj.props, *keys::DEVICE_ID) } else { None };
 
             let mut st = state.borrow_mut();
             st.node_ids.insert(obj.id);
@@ -120,20 +116,54 @@ pub fn handle_global(state: &Rc<RefCell<PwState>>, obj: &pipewire::registry::Glo
             };
 
             let node_id = obj.id;
-            let event_tx = st.event_tx.clone();
+            // Hardware nodes' *authoritative* volume/mute comes from the parent Device's Route
+            // (see the Device arm below and device_route.rs) - their own Props can independently
+            // report a different, non-authoritative value (observed in practice: a Route of
+            // exactly 1.0 alongside a Props of 0.91 for the same physical output). Since both
+            // would otherwise race to set the same `NodeInfo.volumes` field with no precedence,
+            // a route-linked node's own Props updates are ignored once the link below resolves.
+            let is_route_linked = Rc::new(Cell::new(false));
             let listener = node
                 .add_listener_local()
-                .param(move |_seq, param_type, _index, _next, param| {
-                    if param_type != ParamType::Props {
-                        return;
-                    }
-                    if let Some(param) = param {
-                        if let Some((volumes, mute)) = node_props::parse_props(param) {
-                            let _ = event_tx.send_blocking(Event::NodeVolumeChanged {
+                .info({
+                    let state = state.clone();
+                    let is_route_linked = is_route_linked.clone();
+                    move |info| {
+                        let Some(device_id) = device_id_hint else { return };
+                        let Some(card_profile_device) =
+                            info.props().and_then(|p| p.get("card.profile.device")).and_then(|v| v.parse().ok())
+                        else {
+                            return;
+                        };
+                        let link = (device_id, card_profile_device);
+                        is_route_linked.set(true);
+
+                        let mut st = state.borrow_mut();
+                        st.node_route_link.insert(node_id, link);
+                        if let Some(route) = st.routes.get(&link) {
+                            let _ = st.event_tx.send_blocking(Event::NodeVolumeChanged {
                                 id: node_id,
-                                volumes,
-                                mute,
+                                volumes: route.volumes.clone(),
+                                mute: route.mute,
                             });
+                        }
+                    }
+                })
+                .param({
+                    let event_tx = st.event_tx.clone();
+                    let is_route_linked = is_route_linked.clone();
+                    move |_seq, param_type, _index, _next, param| {
+                        if param_type != ParamType::Props || is_route_linked.get() {
+                            return;
+                        }
+                        if let Some(param) = param {
+                            if let Some((volumes, mute)) = node_props::parse_props(param) {
+                                let _ = event_tx.send_blocking(Event::NodeVolumeChanged {
+                                    id: node_id,
+                                    volumes,
+                                    mute,
+                                });
+                            }
                         }
                     }
                 })
@@ -146,22 +176,6 @@ pub fn handle_global(state: &Rc<RefCell<PwState>>, obj: &pipewire::registry::Glo
             node.enum_params(0, Some(ParamType::Props), 0, 8);
 
             st.nodes.insert(obj.id, BoundNode { node, _listener: listener });
-
-            // Hardware sinks/sources don't carry real volume/mute on their own Props (PipeWire
-            // leaves that at 0.0) - the actual value lives on the parent Device's Route. Link
-            // this node to its route slot, and if that route's state is already known (the
-            // Device may have been discovered before this Node), emit it immediately instead of
-            // leaving the strip at a misleading 0.0 until a fresh Route event happens to arrive.
-            if let Some(link) = route_link {
-                st.node_route_link.insert(node_id, link);
-                if let Some(route) = st.routes.get(&link) {
-                    let _ = st.event_tx.send_blocking(Event::NodeVolumeChanged {
-                        id: node_id,
-                        volumes: route.volumes.clone(),
-                        mute: route.mute,
-                    });
-                }
-            }
         }
         ObjectType::Port => {
             let Some(node_id) = get_u32(obj.props, *keys::NODE_ID) else {
@@ -306,6 +320,12 @@ pub fn handle_global_remove(state: &Rc<RefCell<PwState>>, id: u32) {
         let _ = st.event_tx.send_blocking(Event::PortRemoved { id });
     } else if st.link_ids.remove(&id) {
         let _ = st.event_tx.send_blocking(Event::LinkRemoved { id });
+    } else if st.devices.remove(&id).is_some() {
+        // Drop any cached routes for this device and unlink any nodes that pointed at it, so a
+        // later SetVolume/SetMute for one of those (now orphaned) nodes falls back to its own
+        // Node Props instead of looking up a route that no longer exists.
+        st.routes.retain(|&(device_id, _), _| device_id != id);
+        st.node_route_link.retain(|_, &mut (device_id, _)| device_id != id);
     }
 }
 
