@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Sgithi Audio Meter
+GenericName=Audio Mixer
+Comment=PipeWire mixer and patchbay - pavucontrol + Voicemeeter-style layout + qpwgraph in one app
+Exec=@BIN_PATH@
+Icon=sgithi-audio-meter
+Terminal=false
+Categories=AudioVideo;Audio;Mixer;
+Keywords=pipewire;pulseaudio;volume;mixer;patchbay;voicemeeter;pavucontrol;
+StartupNotify=true

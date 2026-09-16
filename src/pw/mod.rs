@@ -1,4 +1,5 @@
 pub mod commands;
+mod device_profile;
 mod device_route;
 pub mod events;
 mod metadata;

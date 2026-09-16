@@ -1054,6 +1054,7 @@ dependencies = [
  "gtk4",
  "log",
  "pipewire",
+ "serde",
  "serde_json",
 ]
 

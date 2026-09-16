@@ -7,7 +7,8 @@ use gtk::{glib, Application, ApplicationWindow, HeaderBar, Stack, StackSwitcher}
 use crate::model::Graph;
 use crate::pw;
 
-use super::mixer::MixerPage;
+use super::applications::ApplicationsPage;
+use super::devices::DevicesPage;
 use super::patchbay::PatchbayPage;
 
 const APP_ID: &str = "ca.millerfamily.SgithiAudioMeter";
@@ -22,11 +23,13 @@ fn build_window(app: &Application) {
     let (cmd_tx, event_rx) = pw::spawn();
 
     let graph = Rc::new(RefCell::new(Graph::new()));
-    let mixer_page = MixerPage::new(cmd_tx.clone());
+    let devices_page = DevicesPage::new(graph.clone(), cmd_tx.clone());
+    let applications_page = ApplicationsPage::new(graph.clone(), cmd_tx.clone());
     let patchbay_page = PatchbayPage::new(graph.clone(), cmd_tx.clone());
 
     let stack = Stack::new();
-    stack.add_titled(&mixer_page.widget, Some("mixer"), "Mixer");
+    stack.add_titled(&devices_page.widget, Some("devices"), "Devices");
+    stack.add_titled(&applications_page.widget, Some("applications"), "Applications");
     stack.add_titled(&patchbay_page.widget, Some("patchbay"), "Patchbay");
 
     let switcher = StackSwitcher::new();
@@ -55,7 +58,8 @@ fn build_window(app: &Application) {
     glib::spawn_future_local(async move {
         while let Ok(event) = event_rx.recv().await {
             graph.borrow_mut().apply(event);
-            mixer_page.sync(&graph.borrow());
+            devices_page.sync();
+            applications_page.sync();
             patchbay_page.sync();
         }
     });

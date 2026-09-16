@@ -1,4 +1,7 @@
 pub mod app;
-mod mixer;
+mod applications;
+mod devices;
+mod overrides;
 mod patchbay;
+mod strip;
 mod volume;

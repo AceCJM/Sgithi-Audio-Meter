@@ -3,7 +3,7 @@
 //! These are plain, `Send + 'static` values with no PipeWire types inside, so they can safely
 //! cross the thread boundary and be applied to `model::Graph` on the GTK thread.
 
-use crate::model::Direction;
+use crate::model::{Direction, ProfileOption};
 
 #[derive(Debug, Clone)]
 pub enum Event {
@@ -45,5 +45,19 @@ pub enum Event {
     },
     DefaultSourceChanged {
         node_name: Option<String>,
+    },
+    DeviceAdded {
+        id: u32,
+        name: String,
+    },
+    DeviceRemoved {
+        id: u32,
+    },
+    /// `active` is `None` when this update only carries a (possibly partial, as `EnumProfile`
+    /// results arrive one at a time) profile list, not a change in which one is active.
+    DeviceProfilesUpdated {
+        id: u32,
+        profiles: Vec<ProfileOption>,
+        active: Option<i32>,
     },
 }
