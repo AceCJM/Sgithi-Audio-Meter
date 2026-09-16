@@ -61,6 +61,22 @@ impl NodeInfo {
         is_hardware(&self.media_class)
     }
 
+    /// Best-effort classification of a hardware `Audio/Source` as a microphone versus another
+    /// kind of capture input (line-in, a device's own monitor/loopback input, etc.).
+    ///
+    /// PipeWire doesn't expose a reliable per-node "this is a microphone" flag - the closest
+    /// thing, `port.type` ("mic" vs "line"), lives on the `Device`'s `Route` param, not on the
+    /// Node itself (and isn't currently parsed by `device_route.rs`). This instead checks for
+    /// "mic"/"microphone" in the node's display name, which happens to track the real
+    /// distinction for the hardware this was tested against (a Focusrite Scarlett Solo: "Input 2
+    /// Mic" vs "Monitor Input 3/4", "Input 1 Inst/Line") since vendors typically name mic inputs
+    /// accordingly - but it's a heuristic, not a guarantee.
+    pub fn is_mic_like(&self) -> bool {
+        self.is_hardware()
+            && self.media_class == "Audio/Source"
+            && self.display_name().to_lowercase().contains("mic")
+    }
+
     /// Average of the per-channel volumes, for a single-fader display.
     pub fn volume(&self) -> f32 {
         if self.volumes.is_empty() {
@@ -83,6 +99,22 @@ pub struct PortInfo {
     pub direction: Direction,
 }
 
+/// One selectable option for a `Device`'s active profile (e.g. "Off", "Analog Stereo Duplex",
+/// "Pro Audio" for an audio interface with multiple operating modes).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProfileOption {
+    pub index: i32,
+    pub description: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct DeviceInfo {
+    pub id: u32,
+    pub name: String,
+    pub profiles: Vec<ProfileOption>,
+    pub active_profile: Option<i32>,
+}
+
 #[derive(Debug, Clone)]
 pub struct LinkInfo {
     pub id: u32,
@@ -102,6 +134,7 @@ pub struct Graph {
     pub nodes: HashMap<u32, NodeInfo>,
     pub ports: HashMap<u32, PortInfo>,
     pub links: HashMap<u32, LinkInfo>,
+    pub devices: HashMap<u32, DeviceInfo>,
     pub default_sink: Option<u32>,
     pub default_source: Option<u32>,
 }
@@ -151,6 +184,20 @@ impl Graph {
             }
             Event::DefaultSourceChanged { node_name } => {
                 self.default_source = node_name.and_then(|name| self.find_node_by_name(&name));
+            }
+            Event::DeviceAdded { id, name } => {
+                self.devices.insert(id, DeviceInfo { id, name, profiles: Vec::new(), active_profile: None });
+            }
+            Event::DeviceRemoved { id } => {
+                self.devices.remove(&id);
+            }
+            Event::DeviceProfilesUpdated { id, profiles, active } => {
+                if let Some(device) = self.devices.get_mut(&id) {
+                    device.profiles = profiles;
+                    if active.is_some() {
+                        device.active_profile = active;
+                    }
+                }
             }
         }
     }

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::model::{Direction, Graph, PortInfo};
 
@@ -16,21 +16,33 @@ pub struct NodeLayout {
     pub y: f64,
 }
 
-/// Screen-space layout for the patchbay canvas: a position per node (auto-placed in columns by
-/// direction on first appearance, user-draggable afterward) plus the hit-testing/coordinate math
-/// shared between rendering and interaction.
+/// Screen-space layout for the patchbay canvas: a position per node (restored from a saved
+/// layout by node name if one exists, else auto-placed in columns by direction, user-draggable
+/// afterward either way) plus the hit-testing/coordinate math shared between rendering and
+/// interaction.
 pub struct CanvasModel {
     positions: HashMap<u32, NodeLayout>,
+    /// Positions saved from a previous run, keyed by node name (ids aren't stable across
+    /// restarts). Consumed as nodes are first placed in `sync()`; see `persistence.rs`.
+    saved: HashMap<String, (f64, f64)>,
+    /// Nodes currently hidden from the canvas (see `node_rect`, the single choke point that
+    /// makes a hidden node invisible, unclickable, and excluded from link drawing/`extent()`).
+    hidden: HashSet<u32>,
+    /// Names of nodes hidden in a previous run, consumed the same way `saved` positions are.
+    hidden_by_name: HashSet<String>,
 }
 
 impl CanvasModel {
-    pub fn new() -> Self {
-        Self { positions: HashMap::new() }
+    pub fn new(saved: HashMap<String, (f64, f64)>, hidden_by_name: HashSet<String>) -> Self {
+        Self { positions: HashMap::new(), saved, hidden: HashSet::new(), hidden_by_name }
     }
 
-    /// Drop layout entries for nodes that no longer exist, and place any new nodes.
+    /// Drop layout entries for nodes that no longer exist, and place any new nodes (from the
+    /// saved layout if that node's name is in it, else the auto-layout heuristic); likewise
+    /// restore hidden state for newly (re)appearing nodes from the saved hidden-name set.
     pub fn sync(&mut self, graph: &Graph) {
         self.positions.retain(|id, _| graph.nodes.contains_key(id));
+        self.hidden.retain(|id| graph.nodes.contains_key(id));
 
         let mut ids: Vec<_> = graph.nodes.keys().copied().collect();
         ids.sort_unstable();
@@ -38,6 +50,13 @@ impl CanvasModel {
         let mut column_y = [MARGIN, MARGIN, MARGIN];
         for id in ids {
             if self.positions.contains_key(&id) {
+                continue;
+            }
+            if self.hidden_by_name.contains(&graph.nodes[&id].name) {
+                self.hidden.insert(id);
+            }
+            if let Some(&(x, y)) = graph.nodes.get(&id).and_then(|n| self.saved.get(&n.name)) {
+                self.positions.insert(id, NodeLayout { x, y });
                 continue;
             }
             let has_out = graph.ports_for_node(id).any(|p| p.direction == Direction::Output);
@@ -56,6 +75,36 @@ impl CanvasModel {
         }
     }
 
+    /// The current layout, keyed by node name instead of id, for saving to disk.
+    pub fn positions_by_name(&self, graph: &Graph) -> HashMap<String, (f64, f64)> {
+        self.positions
+            .iter()
+            .filter_map(|(id, pos)| Some((graph.nodes.get(id)?.name.clone(), (pos.x, pos.y))))
+            .collect()
+    }
+
+    pub fn hide(&mut self, id: u32) {
+        self.hidden.insert(id);
+    }
+
+    pub fn show(&mut self, id: u32) {
+        self.hidden.remove(&id);
+    }
+
+    /// Currently-hidden nodes still present in the graph, as `(id, display name)` pairs, for
+    /// building a "show hidden node" menu.
+    pub fn hidden_nodes<'g>(&self, graph: &'g Graph) -> Vec<(u32, &'g str)> {
+        let mut nodes: Vec<_> =
+            self.hidden.iter().filter_map(|&id| Some((id, graph.nodes.get(&id)?.display_name()))).collect();
+        nodes.sort_by_key(|(id, _)| *id);
+        nodes
+    }
+
+    /// The current hidden set, keyed by node name instead of id, for saving to disk.
+    pub fn hidden_by_name(&self, graph: &Graph) -> HashSet<String> {
+        self.hidden.iter().filter_map(|id| Some(graph.nodes.get(id)?.name.clone())).collect()
+    }
+
     pub fn node_height(&self, graph: &Graph, id: u32) -> f64 {
         let in_count = graph.ports_for_node(id).filter(|p| p.direction == Direction::Input).count();
         let out_count = graph.ports_for_node(id).filter(|p| p.direction == Direction::Output).count();
@@ -63,6 +112,9 @@ impl CanvasModel {
     }
 
     pub fn node_rect(&self, graph: &Graph, id: u32) -> Option<(f64, f64, f64, f64)> {
+        if self.hidden.contains(&id) {
+            return None;
+        }
         let pos = self.positions.get(&id)?;
         Some((pos.x, pos.y, NODE_WIDTH, self.node_height(graph, id)))
     }

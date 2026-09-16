@@ -18,9 +18,10 @@ use pipewire::spa::param::ParamType;
 use pipewire::spa::utils::dict::DictRef;
 use pipewire::types::ObjectType;
 
-use crate::model::{is_hardware, Direction};
+use crate::model::{is_hardware, Direction, ProfileOption};
 
 use super::commands::Command;
+use super::device_profile;
 use super::device_route::{self, RouteVolume};
 use super::events::Event;
 use super::metadata as meta;
@@ -52,6 +53,10 @@ pub struct PwState {
     node_route_link: HashMap<u32, (u32, i32)>,
     /// Last known route state, keyed by (PipeWire device id, route-device slot).
     routes: HashMap<(u32, i32), RouteVolume>,
+    /// Available profiles per device id, accumulated as `EnumProfile` results arrive one at a
+    /// time; keyed by profile index within the inner map to dedupe re-delivered entries.
+    device_profiles: HashMap<u32, HashMap<i32, ProfileOption>>,
+    device_active_profile: HashMap<u32, i32>,
 }
 
 impl PwState {
@@ -69,6 +74,8 @@ impl PwState {
             devices: HashMap::new(),
             node_route_link: HashMap::new(),
             routes: HashMap::new(),
+            device_profiles: HashMap::new(),
+            device_active_profile: HashMap::new(),
         }
     }
 }
@@ -79,6 +86,15 @@ fn get(props: Option<&DictRef>, key: &str) -> Option<String> {
 
 fn get_u32(props: Option<&DictRef>, key: &str) -> Option<u32> {
     props.and_then(|p| p.get(key)).and_then(|v| v.parse().ok())
+}
+
+/// Send the current merged profile list (+ active profile, if known) for a device.
+fn send_device_profiles(st: &PwState, event_tx: &async_channel::Sender<Event>, device_id: u32, active: Option<i32>) {
+    let mut profiles: Vec<ProfileOption> =
+        st.device_profiles.get(&device_id).map(|m| m.values().cloned().collect()).unwrap_or_default();
+    profiles.sort_by_key(|p| p.index);
+    let active = active.or_else(|| st.device_active_profile.get(&device_id).copied());
+    let _ = event_tx.send_blocking(Event::DeviceProfilesUpdated { id: device_id, profiles, active });
 }
 
 /// Handle a newly discovered registry global. Binds a proxy for Node/Metadata (needed to send
@@ -258,44 +274,67 @@ pub fn handle_global(state: &Rc<RefCell<PwState>>, obj: &pipewire::registry::Glo
             };
 
             let device_id = obj.id;
+            let device_name = get(obj.props, *keys::DEVICE_DESCRIPTION)
+                .or_else(|| get(obj.props, *keys::DEVICE_NICK))
+                .or_else(|| get(obj.props, *keys::DEVICE_NAME))
+                .unwrap_or_else(|| format!("device-{device_id}"));
+            let _ = st.event_tx.send_blocking(Event::DeviceAdded { id: device_id, name: device_name });
+
             let event_tx = st.event_tx.clone();
-            let state_for_route = state.clone();
+            let state_for_param = state.clone();
             let listener = device
                 .add_listener_local()
                 .param(move |_seq, param_type, _index, _next, param| {
-                    if param_type != ParamType::Route {
-                        return;
-                    }
                     let Some(param) = param else { return };
-                    let Some(route) = device_route::parse_route(param) else { return };
+                    match param_type {
+                        ParamType::Route => {
+                            let Some(route) = device_route::parse_route(param) else { return };
 
-                    let mut st = state_for_route.borrow_mut();
-                    let key = (device_id, route.route_device);
-                    let volumes = route.volumes.clone();
-                    let mute = route.mute;
-                    st.routes.insert(key, route);
+                            let mut st = state_for_param.borrow_mut();
+                            let key = (device_id, route.route_device);
+                            let volumes = route.volumes.clone();
+                            let mute = route.mute;
+                            st.routes.insert(key, route);
 
-                    let affected: Vec<u32> = st
-                        .node_route_link
-                        .iter()
-                        .filter(|(_, link)| **link == key)
-                        .map(|(&node_id, _)| node_id)
-                        .collect();
-                    drop(st);
-                    for node_id in affected {
-                        let _ = event_tx.send_blocking(Event::NodeVolumeChanged {
-                            id: node_id,
-                            volumes: volumes.clone(),
-                            mute,
-                        });
+                            let affected: Vec<u32> = st
+                                .node_route_link
+                                .iter()
+                                .filter(|(_, link)| **link == key)
+                                .map(|(&node_id, _)| node_id)
+                                .collect();
+                            drop(st);
+                            for node_id in affected {
+                                let _ = event_tx.send_blocking(Event::NodeVolumeChanged {
+                                    id: node_id,
+                                    volumes: volumes.clone(),
+                                    mute,
+                                });
+                            }
+                        }
+                        ParamType::EnumProfile => {
+                            let Some(profile) = device_profile::parse_profile(param) else { return };
+                            let mut st = state_for_param.borrow_mut();
+                            st.device_profiles.entry(device_id).or_default().insert(profile.index, profile);
+                            send_device_profiles(&st, &event_tx, device_id, None);
+                        }
+                        ParamType::Profile => {
+                            let Some(profile) = device_profile::parse_profile(param) else { return };
+                            let mut st = state_for_param.borrow_mut();
+                            st.device_active_profile.insert(device_id, profile.index);
+                            send_device_profiles(&st, &event_tx, device_id, Some(profile.index));
+                        }
+                        _ => {}
                     }
                 })
                 .register();
 
-            device.subscribe_params(&[ParamType::Route]);
-            // `num` bounded rather than u32::MAX - see the comment on the Node Props enum_params
-            // call above. A real device realistically has well under a few dozen routes.
+            device.subscribe_params(&[ParamType::Route, ParamType::EnumProfile, ParamType::Profile]);
+            // `num` bounded rather than u32::MAX in every case here - see the comment on the Node
+            // Props enum_params call above. A real device realistically has well under a few
+            // dozen routes or profiles, and exactly one currently-active profile.
             device.enum_params(0, Some(ParamType::Route), 0, 32);
+            device.enum_params(0, Some(ParamType::EnumProfile), 0, 16);
+            device.enum_params(0, Some(ParamType::Profile), 0, 4);
 
             st.devices.insert(device_id, BoundDevice { device, _listener: listener });
         }
@@ -326,6 +365,9 @@ pub fn handle_global_remove(state: &Rc<RefCell<PwState>>, id: u32) {
         // Node Props instead of looking up a route that no longer exists.
         st.routes.retain(|&(device_id, _), _| device_id != id);
         st.node_route_link.retain(|_, &mut (device_id, _)| device_id != id);
+        st.device_profiles.remove(&id);
+        st.device_active_profile.remove(&id);
+        let _ = st.event_tx.send_blocking(Event::DeviceRemoved { id });
     }
 }
 
@@ -363,6 +405,16 @@ pub fn handle_command(state: &Rc<RefCell<PwState>>, main_loop: &MainLoopRc, cmd:
         }
         Command::SetDefaultSource { node_name } => {
             set_default(&st, meta::DEFAULT_SOURCE_KEY, &node_name);
+        }
+        Command::SetProfile { device_id, profile_index } => {
+            let Some(bound) = st.devices.get(&device_id) else {
+                log::warn!("no bound device {device_id}, cannot set profile");
+                return;
+            };
+            let pod_bytes = device_profile::build_set_profile_pod(profile_index);
+            if let Some(pod) = pipewire::spa::pod::Pod::from_bytes(&pod_bytes) {
+                bound.device.set_param(ParamType::Profile, 0, pod);
+            }
         }
         Command::Terminate => {
             main_loop.quit();

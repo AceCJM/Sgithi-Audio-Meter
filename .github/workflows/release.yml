@@ -1,0 +1,50 @@
+name: Release
+
+# Builds a Linux x86_64 binary and attaches it to a GitHub Release whenever a tag matching
+# v* is pushed (e.g. v0.2.0). Doesn't run on every push/PR - see BACKLOG.md if you want that too.
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config libgtk-4-dev libpipewire-0.3-dev libglib2.0-dev libclang-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Package
+        run: |
+          name=sgithi-audio-meter-${{ github.ref_name }}-linux-x86_64
+          mkdir -p "dist/$name"
+          cp target/release/sgithi-audio-meter "dist/$name/"
+          cp README.md LICENSE "dist/$name/"
+          cp -r packaging "dist/$name/"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.tar.gz

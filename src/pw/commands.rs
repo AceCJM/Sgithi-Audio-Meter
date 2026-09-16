@@ -9,5 +9,6 @@ pub enum Command {
     DestroyLink { link_id: u32 },
     SetDefaultSink { node_name: String },
     SetDefaultSource { node_name: String },
+    SetProfile { device_id: u32, profile_index: i32 },
     Terminate,
 }
