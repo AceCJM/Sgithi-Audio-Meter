@@ -26,6 +26,7 @@ use super::device_route::{self, RouteVolume};
 use super::events::Event;
 use super::metadata as meta;
 use super::node_props;
+use super::peak::{self, PeakWatch};
 
 struct BoundNode {
     node: Node,
@@ -57,6 +58,9 @@ pub struct PwState {
     /// time; keyed by profile index within the inner map to dedupe re-delivered entries.
     device_profiles: HashMap<u32, HashMap<i32, ProfileOption>>,
     device_active_profile: HashMap<u32, i32>,
+    /// One metering stream per node a `Strip` currently has on screen (see `pw::peak`), keyed by
+    /// node id and torn down on `Command::UnwatchPeak`.
+    peaks: HashMap<u32, PeakWatch>,
 }
 
 impl PwState {
@@ -76,6 +80,7 @@ impl PwState {
             routes: HashMap::new(),
             device_profiles: HashMap::new(),
             device_active_profile: HashMap::new(),
+            peaks: HashMap::new(),
         }
     }
 }
@@ -102,6 +107,12 @@ fn send_device_profiles(st: &PwState, event_tx: &async_channel::Sender<Event>, d
 pub fn handle_global(state: &Rc<RefCell<PwState>>, obj: &pipewire::registry::GlobalObject<&DictRef>) {
     match obj.type_ {
         ObjectType::Node => {
+            // The app's own peak-metering streams (`pw::peak`) are themselves regular nodes -
+            // never surface one as an application stream, or its `Strip` would start metering
+            // *it*, which would start another metering stream, and so on.
+            if get(obj.props, *keys::NODE_NAME).as_deref().is_some_and(|n| n.starts_with(peak::STREAM_NAME_PREFIX)) {
+                return;
+            }
             let Some(media_class) = get(obj.props, *keys::MEDIA_CLASS) else {
                 return;
             };
@@ -372,8 +383,16 @@ pub fn handle_global_remove(state: &Rc<RefCell<PwState>>, id: u32) {
 }
 
 pub fn handle_command(state: &Rc<RefCell<PwState>>, main_loop: &MainLoopRc, cmd: Command) {
-    let st = state.borrow();
+    let mut st = state.borrow_mut();
     match cmd {
+        Command::WatchPeak { node_id, node_name, capture_sink } => {
+            if let Some(watch) = peak::start(&st.core, &st.event_tx, node_id, &node_name, capture_sink) {
+                st.peaks.insert(node_id, watch);
+            }
+        }
+        Command::UnwatchPeak { node_id } => {
+            st.peaks.remove(&node_id);
+        }
         Command::SetVolume { node_id, volumes } => set_node_volume(&st, node_id, Some(&volumes), None),
         Command::SetMute { node_id, mute } => set_node_volume(&st, node_id, None, Some(mute)),
         Command::CreateLink { output_node, output_port, input_node, input_port } => {

@@ -42,6 +42,14 @@ pub fn is_hardware(media_class: &str) -> bool {
     matches!(media_class, "Audio/Sink" | "Audio/Source")
 }
 
+/// True for nodes that *receive* audio (hardware `Audio/Sink` outputs, and app
+/// `Stream/Input/Audio` recording streams) as opposed to nodes that *produce* it. Peak metering
+/// (`pw::peak`) needs this to decide whether to tap a node's monitor (`STREAM_CAPTURE_SINK`) or
+/// connect to it directly.
+pub fn is_sink_like(media_class: &str) -> bool {
+    matches!(media_class, "Audio/Sink" | "Stream/Input/Audio")
+}
+
 #[derive(Debug, Clone)]
 pub struct NodeInfo {
     pub id: u32,
@@ -50,6 +58,9 @@ pub struct NodeInfo {
     pub media_class: String,
     pub volumes: Vec<f32>,
     pub mute: bool,
+    /// Most recent linear peak sample seen by this node's metering stream (`pw::peak`), 0.0 if
+    /// none has arrived yet (e.g. metering hasn't started, or nothing is playing).
+    pub peak: f32,
 }
 
 impl NodeInfo {
@@ -154,7 +165,15 @@ impl Graph {
             Event::NodeAdded { id, name, description, media_class } => {
                 self.nodes.insert(
                     id,
-                    NodeInfo { id, name, description, media_class, volumes: Vec::new(), mute: false },
+                    NodeInfo {
+                        id,
+                        name,
+                        description,
+                        media_class,
+                        volumes: Vec::new(),
+                        mute: false,
+                        peak: 0.0,
+                    },
                 );
             }
             Event::NodeRemoved { id } => {
@@ -197,6 +216,11 @@ impl Graph {
                     if active.is_some() {
                         device.active_profile = active;
                     }
+                }
+            }
+            Event::PeakLevel { id, peak } => {
+                if let Some(node) = self.nodes.get_mut(&id) {
+                    node.peak = peak;
                 }
             }
         }

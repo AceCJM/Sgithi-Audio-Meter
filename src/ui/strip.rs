@@ -3,9 +3,12 @@ use std::rc::Rc;
 
 use gtk::glib::SignalHandlerId;
 use gtk::prelude::*;
-use gtk::{Box as GtkBox, Button, DropDown, Entry, Justification, Label, Orientation, Popover, Scale, ToggleButton};
+use gtk::{
+    Box as GtkBox, Button, DropDown, Entry, Justification, Label, LevelBar, Orientation, Popover, Scale,
+    ToggleButton,
+};
 
-use crate::model::NodeInfo;
+use crate::model::{is_sink_like, NodeInfo};
 use crate::pw::Command;
 use crate::ui::overrides::{Category, Overrides};
 use crate::ui::volume;
@@ -13,6 +16,8 @@ use crate::ui::volume;
 /// One vertical fader strip for a single node (hardware device or app stream).
 pub struct Strip {
     pub widget: GtkBox,
+    node_id: u32,
+    cmd_tx: pipewire::channel::Sender<Command>,
     name_label: Label,
     scale: Scale,
     scale_changed: SignalHandlerId,
@@ -20,6 +25,7 @@ pub struct Strip {
     mute_button: ToggleButton,
     mute_toggled: SignalHandlerId,
     default_button: Option<Button>,
+    peak_meter: LevelBar,
     /// Number of channels last reported for this node, so a fader move sets every channel
     /// rather than assuming stereo.
     channels: Rc<Cell<usize>>,
@@ -91,8 +97,29 @@ impl Strip {
                 let _ = cmd_tx.send(Command::SetVolume { node_id, volumes });
             })
         };
-        widget.append(&scale);
+
+        // Read-only live level meter (`pw::peak`), fed by `Event::PeakLevel` via `update()` below
+        // - not a control, so unlike the fader/mute button it needs no signal-blocking treatment.
+        let peak_meter = LevelBar::new();
+        peak_meter.set_orientation(Orientation::Vertical);
+        peak_meter.set_inverted(true);
+        peak_meter.set_min_value(0.0);
+        peak_meter.set_max_value(1.0);
+        peak_meter.set_height_request(220);
+        peak_meter.set_width_request(10);
+
+        let fader_row = GtkBox::new(Orientation::Horizontal, 4);
+        fader_row.set_vexpand(true);
+        fader_row.append(&scale);
+        fader_row.append(&peak_meter);
+        widget.append(&fader_row);
         widget.append(&volume_label);
+
+        let _ = cmd_tx.send(Command::WatchPeak {
+            node_id,
+            node_name: node.name.clone(),
+            capture_sink: is_sink_like(&node.media_class),
+        });
 
         let mute_button = ToggleButton::with_label("Mute");
         mute_button.set_active(node.mute);
@@ -129,6 +156,8 @@ impl Strip {
 
         Self {
             widget,
+            node_id,
+            cmd_tx,
             name_label,
             scale,
             scale_changed,
@@ -136,6 +165,7 @@ impl Strip {
             mute_button,
             mute_toggled,
             default_button,
+            peak_meter,
             channels,
         }
     }
@@ -169,6 +199,26 @@ impl Strip {
             button.set_label(if is_default { "Default \u{2713}" } else { "Set Default" });
             button.set_sensitive(!is_default);
         }
+
+        self.peak_meter.set_value(node.peak.min(1.0) as f64);
+    }
+
+    /// Update just the peak meter, bypassing everything else `update()` touches. `Event::PeakLevel`
+    /// arrives at up to ~30Hz *per node* (see `pw::peak`) - routing it through a full page `sync()`
+    /// (which reconciles every strip's placement, name, volume and mute state) made a handful of
+    /// watched nodes alone peg a CPU core, so `ui::app`'s event loop calls this directly instead.
+    pub fn set_peak(&self, peak: f32) {
+        self.peak_meter.set_value(peak.min(1.0) as f64);
+    }
+}
+
+impl Drop for Strip {
+    /// Stop this node's metering stream (started in `Strip::new` via `Command::WatchPeak`) once
+    /// its strip is no longer shown - `PwState.peaks` in the PipeWire thread otherwise has no
+    /// other way to learn a node's strip went away (a category change or node removal just drops
+    /// the `Strip` value, it isn't a PipeWire event).
+    fn drop(&mut self) {
+        let _ = self.cmd_tx.send(Command::UnwatchPeak { node_id: self.node_id });
     }
 }
 
