@@ -57,6 +57,17 @@ fn build_window(app: &Application) {
 
     glib::spawn_future_local(async move {
         while let Ok(event) = event_rx.recv().await {
+            // `PeakLevel` arrives far more often (~30Hz per watched node - see `pw::peak`) than
+            // every other event, and a full page `sync()` reconciles *all* strips' placement,
+            // name, volume and mute state - cheap for an occasional volume change, but expensive
+            // enough at peak-meter frequency to peg a CPU core with only a handful of nodes on
+            // screen. Route it straight to the one strip it affects instead.
+            if let pw::Event::PeakLevel { id, peak } = event {
+                graph.borrow_mut().apply(pw::Event::PeakLevel { id, peak });
+                devices_page.update_peak(id, peak);
+                applications_page.update_peak(id, peak);
+                continue;
+            }
             graph.borrow_mut().apply(event);
             devices_page.sync();
             applications_page.sync();

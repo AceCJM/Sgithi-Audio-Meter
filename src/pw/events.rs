@@ -60,4 +60,10 @@ pub enum Event {
         profiles: Vec<ProfileOption>,
         active: Option<i32>,
     },
+    /// A throttled (~30Hz) linear peak sample from a watched node's metering stream (see
+    /// `pw::peak`), only sent for nodes a `Strip` has asked to watch.
+    PeakLevel {
+        id: u32,
+        peak: f32,
+    },
 }

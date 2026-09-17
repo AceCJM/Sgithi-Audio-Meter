@@ -138,4 +138,12 @@ impl ApplicationsPage {
             strips.insert(node.id, (strip, placement));
         }
     }
+
+    /// Fast path for `Event::PeakLevel`, called directly by `ui::app`'s event loop instead of
+    /// `sync()` - see `Strip::set_peak` for why.
+    pub fn update_peak(&self, node_id: u32, peak: f32) {
+        if let Some((strip, _)) = self.strips.borrow().get(&node_id) {
+            strip.set_peak(peak);
+        }
+    }
 }

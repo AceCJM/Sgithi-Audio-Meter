@@ -4,6 +4,7 @@ mod device_route;
 pub mod events;
 mod metadata;
 mod node_props;
+mod peak;
 mod registry;
 mod thread;
 
