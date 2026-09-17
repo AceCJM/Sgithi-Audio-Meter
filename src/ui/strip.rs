@@ -26,6 +26,9 @@ pub struct Strip {
     mute_toggled: SignalHandlerId,
     default_button: Option<Button>,
     peak_meter: LevelBar,
+    /// The rename/re-categorize popover built in `build_edit_popover`, parented to the pencil
+    /// button - see `Drop` for why `Strip` needs to hold onto it.
+    edit_popover: Popover,
     /// Number of channels last reported for this node, so a fader move sets every channel
     /// rather than assuming stereo.
     channels: Rc<Cell<usize>>,
@@ -69,7 +72,7 @@ impl Strip {
         name_row.append(&edit_button);
         widget.append(&name_row);
 
-        build_edit_popover(&edit_button, &name_label, node, overrides, resync);
+        let edit_popover = build_edit_popover(&edit_button, &name_label, node, overrides, resync);
 
         // The fader works in perceptual (cubic) units, not the linear amplitude PipeWire sends
         // over the wire - see `ui::volume`. Range 0.0-1.5 matches pavucontrol's 0%-150%.
@@ -166,6 +169,7 @@ impl Strip {
             mute_toggled,
             default_button,
             peak_meter,
+            edit_popover,
             channels,
         }
     }
@@ -213,12 +217,20 @@ impl Strip {
 }
 
 impl Drop for Strip {
-    /// Stop this node's metering stream (started in `Strip::new` via `Command::WatchPeak`) once
-    /// its strip is no longer shown - `PwState.peaks` in the PipeWire thread otherwise has no
-    /// other way to learn a node's strip went away (a category change or node removal just drops
-    /// the `Strip` value, it isn't a PipeWire event).
     fn drop(&mut self) {
+        // Stop this node's metering stream (started in `Strip::new` via `Command::WatchPeak`)
+        // once its strip is no longer shown - `PwState.peaks` in the PipeWire thread otherwise has
+        // no other way to learn a node's strip went away (a category change or node removal just
+        // drops the `Strip` value, it isn't a PipeWire event).
         let _ = self.cmd_tx.send(Command::UnwatchPeak { node_id: self.node_id });
+
+        // `edit_popover` is `set_parent()`ed to the pencil button (see `build_edit_popover`)
+        // rather than owned by a container `add`/`append` call, so removing `widget` from its
+        // `FlowBox` never detaches it - without this, dropping the strip finalizes the pencil
+        // button while the popover is still attached, which GTK logs as "Finalizing GtkButton...
+        // but it still has children left" (caught live: switching a device's profile, which tears
+        // down and recreates all its strips, produced a wave of these).
+        self.edit_popover.unparent();
     }
 }
 
@@ -229,7 +241,7 @@ fn build_edit_popover(
     node: &NodeInfo,
     overrides: Rc<RefCell<Overrides>>,
     resync: Rc<dyn Fn()>,
-) {
+) -> Popover {
     let node_name = node.name.clone();
     let pipewire_name = node.display_name().to_string();
     // Only hardware capture devices have a Microphone/Other Input categorization to override -
@@ -324,6 +336,8 @@ fn build_edit_popover(
             resync();
         });
     }
+
+    popover
 }
 
 /// Show a linear volume as a percentage, styled red (GTK's built-in "error" semantic class) when
