@@ -3,10 +3,10 @@ use std::rc::Rc;
 
 use adw::prelude::*;
 use adw::{
-    ActionRow, Application, ApplicationWindow, HeaderBar, PreferencesDialog, PreferencesGroup, PreferencesPage,
-    SpinRow, ToolbarView, ViewStack, ViewSwitcher,
+    ActionRow, Application, ApplicationWindow, ColorScheme, ComboRow, HeaderBar, PreferencesDialog,
+    PreferencesGroup, PreferencesPage, SpinRow, ToolbarView, ViewStack, ViewSwitcher,
 };
-use gtk::{glib, Adjustment, Button};
+use gtk::{glib, Adjustment, Button, StringList};
 
 use crate::model::Graph;
 use crate::pw;
@@ -15,7 +15,15 @@ use crate::tray;
 use super::applications::ApplicationsPage;
 use super::devices::DevicesPage;
 use super::patchbay::PatchbayPage;
-use super::settings::{self, Settings};
+use super::settings::{self, Settings, Theme};
+
+fn color_scheme_for(theme: Theme) -> ColorScheme {
+    match theme {
+        Theme::System => ColorScheme::Default,
+        Theme::Light => ColorScheme::PreferLight,
+        Theme::Dark => ColorScheme::PreferDark,
+    }
+}
 
 const APP_ID: &str = "ca.millerfamily.SgithiAudioMeter";
 
@@ -26,14 +34,13 @@ pub fn run() -> glib::ExitCode {
 }
 
 fn build_window(app: &Application) {
-    // "Brighter" per the user's ask - libadwaita otherwise follows the system's light/dark
-    // preference, which on this machine is dark (see the rest of the codebase's screenshots).
-    adw::StyleManager::default().set_color_scheme(adw::ColorScheme::PreferLight);
-
     let (cmd_tx, event_rx) = pw::spawn();
 
     let graph = Rc::new(RefCell::new(Graph::new()));
     let settings = Rc::new(RefCell::new(Settings::load()));
+    // Defaults to Light per the user's "brighter" ask - see `settings::DEFAULT_THEME` - but is a
+    // persisted, user-changeable choice (the Settings dialog's "Appearance" group) from here on.
+    adw::StyleManager::default().set_color_scheme(color_scheme_for(settings.borrow().theme));
     let devices_page = DevicesPage::new(graph.clone(), cmd_tx.clone(), settings.clone());
     let applications_page = ApplicationsPage::new(graph.clone(), cmd_tx.clone(), settings.clone());
     let patchbay_page = PatchbayPage::new(graph.clone(), cmd_tx.clone());
@@ -160,6 +167,22 @@ fn build_settings_dialog(
 ) -> PreferencesDialog {
     let dialog = PreferencesDialog::builder().title("Settings").build();
     let page = PreferencesPage::builder().title("General").icon_name("preferences-system-symbolic").build();
+
+    let appearance_group = PreferencesGroup::builder().title("Appearance").build();
+    let theme_options = StringList::new(&Theme::ALL.map(Theme::label));
+    let theme_row = ComboRow::builder().title("Theme").model(&theme_options).build();
+    theme_row.set_selected(Theme::ALL.iter().position(|&t| t == settings.borrow().theme).unwrap_or(0) as u32);
+    {
+        let settings = settings.clone();
+        theme_row.connect_selected_notify(move |row| {
+            let theme = Theme::ALL[row.selected() as usize];
+            settings.borrow_mut().set_theme(theme);
+            adw::StyleManager::default().set_color_scheme(color_scheme_for(theme));
+        });
+    }
+    appearance_group.add(&theme_row);
+    page.add(&appearance_group);
+
     let group = PreferencesGroup::builder().title("Faders").build();
 
     let adjustment = Adjustment::new(
