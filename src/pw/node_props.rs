@@ -66,3 +66,33 @@ pub fn parse_props(pod: &Pod) -> Option<(Vec<f32>, bool)> {
     };
     extract_volume_mute(&object.properties)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn round_trips_volume_and_mute() {
+        let bytes = build_props_pod(Some(&[0.5, 0.6]), Some(true));
+        let pod = Pod::from_bytes(&bytes).expect("valid pod");
+        let (volumes, mute) = parse_props(pod).expect("volume/mute present");
+        assert_eq!(volumes, vec![0.5, 0.6]);
+        assert!(mute);
+    }
+
+    #[test]
+    fn round_trips_volume_only() {
+        let bytes = build_props_pod(Some(&[1.0]), None);
+        let pod = Pod::from_bytes(&bytes).expect("valid pod");
+        let (volumes, mute) = parse_props(pod).expect("volume/mute present");
+        assert_eq!(volumes, vec![1.0]);
+        assert!(!mute);
+    }
+
+    #[test]
+    fn empty_object_parses_to_none() {
+        let bytes = build_props_pod(None, None);
+        let pod = Pod::from_bytes(&bytes).expect("valid pod");
+        assert!(parse_props(pod).is_none());
+    }
+}

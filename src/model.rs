@@ -243,3 +243,101 @@ impl Graph {
         self.nodes.values().find(|n| n.name == name).map(|n| n.id)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pw::Event;
+
+    fn node_added(id: u32, media_class: &str) -> Event {
+        Event::NodeAdded { id, name: format!("node-{id}"), description: None, media_class: media_class.to_string() }
+    }
+
+    #[test]
+    fn node_lifecycle() {
+        let mut graph = Graph::new();
+        graph.apply(node_added(1, "Audio/Sink"));
+        assert!(graph.nodes.contains_key(&1));
+
+        graph.apply(Event::NodeVolumeChanged { id: 1, volumes: vec![0.5, 0.5], mute: true });
+        let node = &graph.nodes[&1];
+        assert_eq!(node.volumes, vec![0.5, 0.5]);
+        assert!(node.mute);
+
+        graph.apply(Event::NodeRemoved { id: 1 });
+        assert!(!graph.nodes.contains_key(&1));
+    }
+
+    #[test]
+    fn ports_and_links_lifecycle() {
+        let mut graph = Graph::new();
+        graph.apply(node_added(1, "Audio/Sink"));
+        graph.apply(Event::PortAdded { id: 10, node_id: 1, name: "in".into(), direction: Direction::Input });
+        assert_eq!(graph.ports_for_node(1).count(), 1);
+
+        graph.apply(Event::LinkAdded { id: 100, output_node: 2, output_port: 20, input_node: 1, input_port: 10 });
+        assert!(graph.links.contains_key(&100));
+
+        graph.apply(Event::LinkRemoved { id: 100 });
+        assert!(!graph.links.contains_key(&100));
+
+        graph.apply(Event::PortRemoved { id: 10 });
+        assert_eq!(graph.ports_for_node(1).count(), 0);
+    }
+
+    #[test]
+    fn default_sink_resolves_by_name() {
+        let mut graph = Graph::new();
+        graph.apply(Event::NodeAdded {
+            id: 1,
+            name: "alsa_output.pci".into(),
+            description: None,
+            media_class: "Audio/Sink".into(),
+        });
+        graph.apply(Event::DefaultSinkChanged { node_name: Some("alsa_output.pci".into()) });
+        assert_eq!(graph.default_sink, Some(1));
+
+        graph.apply(Event::DefaultSinkChanged { node_name: None });
+        assert_eq!(graph.default_sink, None);
+
+        graph.apply(Event::DefaultSinkChanged { node_name: Some("nonexistent".into()) });
+        assert_eq!(graph.default_sink, None);
+    }
+
+    #[test]
+    fn device_profile_update_preserves_active_when_none() {
+        let mut graph = Graph::new();
+        graph.apply(Event::DeviceAdded { id: 1, name: "card".into() });
+        graph.apply(Event::DeviceProfilesUpdated {
+            id: 1,
+            profiles: vec![ProfileOption { index: 0, description: "Off".into() }],
+            active: Some(0),
+        });
+        assert_eq!(graph.devices[&1].active_profile, Some(0));
+
+        // A partial EnumProfile update (active: None) must not clobber the already-known
+        // active profile - see the `DeviceProfilesUpdated` doc comment on `Event`.
+        graph.apply(Event::DeviceProfilesUpdated {
+            id: 1,
+            profiles: vec![
+                ProfileOption { index: 0, description: "Off".into() },
+                ProfileOption { index: 1, description: "Analog Stereo".into() },
+            ],
+            active: None,
+        });
+        assert_eq!(graph.devices[&1].active_profile, Some(0));
+    }
+
+    #[test]
+    fn peak_level_and_port_type_update_existing_node() {
+        let mut graph = Graph::new();
+        graph.apply(node_added(1, "Audio/Source"));
+
+        graph.apply(Event::PeakLevel { id: 1, peak: 0.75 });
+        assert_eq!(graph.nodes[&1].peak, 0.75);
+
+        graph.apply(Event::NodePortTypeChanged { id: 1, port_type: Some("mic".into()) });
+        assert_eq!(graph.nodes[&1].port_type.as_deref(), Some("mic"));
+        assert!(graph.nodes[&1].is_mic_like());
+    }
+}

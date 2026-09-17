@@ -94,3 +94,40 @@ pub fn build_route_pod(index: i32, route_device: i32, volumes: Option<&[f32]>, m
     });
     node_props::serialize(&value)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_port_type_from_route_info() {
+        let items = vec![
+            Value::Int(2), // n_items (pairs, not raw fields)
+            Value::String("port.type".into()),
+            Value::String("mic".into()),
+            Value::String("other.key".into()),
+            Value::String("other.value".into()),
+        ];
+        assert_eq!(parse_route_info(&items), Some("mic".to_string()));
+    }
+
+    #[test]
+    fn route_info_without_port_type_returns_none() {
+        let items = vec![Value::Int(1), Value::String("other.key".into()), Value::String("other.value".into())];
+        assert_eq!(parse_route_info(&items), None);
+    }
+
+    #[test]
+    fn round_trips_index_device_volume_and_mute() {
+        // 0.404306 is a real Route channelVolumes value seen via pw-dump (see `ui::volume`).
+        let bytes = build_route_pod(2, 0, Some(&[0.404306]), Some(false));
+        let pod = Pod::from_bytes(&bytes).expect("valid pod");
+        let route = parse_route(pod).expect("parses");
+        assert_eq!(route.index, 2);
+        assert_eq!(route.route_device, 0);
+        assert_eq!(route.volumes, vec![0.404306]);
+        assert!(!route.mute);
+        // build_route_pod doesn't set ROUTE_info - only real Device param events carry port.type.
+        assert_eq!(route.port_type, None);
+    }
+}
