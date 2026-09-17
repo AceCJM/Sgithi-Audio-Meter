@@ -1,0 +1,39 @@
+name: CI
+
+# Builds and tests on every push/PR to main - unlike release.yml, which only builds a release
+# binary when a v* tag is pushed.
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config libgtk-4-dev libpipewire-0.3-dev libglib2.0-dev libclang-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+
+      - name: Check
+        run: cargo check --locked --all-targets
+
+      - name: Test
+        run: cargo test --locked

@@ -22,7 +22,7 @@ Future work not in v1, roughly ordered by priority within each section.
 ## Longer-term / stretch
 
 - **Automated tests.** `ui::volume`'s linear/perceptual conversion has unit tests (`cargo test`); everything else doesn't yet. `model::Graph::apply` and the `pw::node_props`/`pw::device_route` pod (de)serialization are the next most testable, PipeWire-independent pieces — a good place to continue (e.g. round-trip a known pod byte sequence).
-- **CI.** No CI configured. Given the app needs system dev headers to even compile (`libgtk-4-dev`, `libpipewire-0.3-dev`, `libclang-dev`), a CI image would need those installed.
+- ~~**CI.**~~ Done (2026-09-16): added `.github/workflows/ci.yml` (build + `cargo test` on every push/PR to `main`), reusing the same apt install line as the existing `release.yml` (which only builds a release binary on a `v*` tag push - a separate, already-working workflow that predates this session). Not pushed yet, so not actually confirmed green on GitHub's runners - only locally, where `cargo check --all-targets` and `cargo test` both pass.
 - **Reconnect handling.** If the PipeWire connection drops (daemon restart), the app doesn't currently attempt to reconnect — it would just go stale.
 - **Search/filter.** No filtering for the mixer page; fine for a handful of devices/streams, would get unwieldy with many concurrent app streams.
 - **Tray icon / background mode.** Voicemeeter typically runs minimized to the tray; this app currently has no such mode.
