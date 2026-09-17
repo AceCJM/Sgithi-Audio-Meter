@@ -32,6 +32,13 @@ pub struct Strip {
     /// Number of channels last reported for this node, so a fader move sets every channel
     /// rather than assuming stereo.
     channels: Rc<Cell<usize>>,
+    /// -1.0 (full left) ..= 1.0 (full right); only meaningful (and only shown - see `update()`)
+    /// for a 2-channel node. Kept separately from the channel volumes PipeWire reports so the
+    /// master fader and the balance control can each be moved independently without the other
+    /// clobbering it - see `balance_to_volumes`/`balance_from_volumes`.
+    balance: Rc<Cell<f32>>,
+    balance_scale: Scale,
+    balance_changed: SignalHandlerId,
 }
 
 impl Strip {
@@ -51,6 +58,7 @@ impl Strip {
     ) -> Self {
         let node_id = node.id;
         let channels = Rc::new(Cell::new(node.volumes.len().max(1)));
+        let balance = Rc::new(Cell::new(balance_from_volumes(&node.volumes)));
 
         let widget = GtkBox::new(Orientation::Vertical, 6);
         widget.set_width_request(90);
@@ -94,11 +102,35 @@ impl Strip {
             let cmd_tx = cmd_tx.clone();
             let channels = channels.clone();
             let volume_label = volume_label.clone();
+            let balance = balance.clone();
             scale.connect_value_changed(move |s| {
                 let perceptual = s.value() as f32;
                 let linear = volume::perceptual_to_linear(perceptual);
                 set_volume_label(&volume_label, linear);
-                let volumes = vec![linear; channels.get()];
+                let volumes = balance_to_volumes(linear, balance.get(), channels.get());
+                let _ = cmd_tx.send(Command::SetVolume { node_id, volumes });
+            })
+        };
+
+        // Balance is only meaningful for a 2-channel node (see `balance_to_volumes`) - hidden
+        // otherwise. Re-checked in `update()` too, since a node's `Strip` is often created before
+        // its first `Props`/Route volume param (and so its real channel count) has arrived.
+        let balance_scale = Scale::with_range(Orientation::Horizontal, -1.0, 1.0, 0.05);
+        balance_scale.set_value(balance.get() as f64);
+        balance_scale.set_draw_value(false);
+        balance_scale.set_width_request(80);
+        balance_scale.set_tooltip_text(Some("Balance"));
+        balance_scale.set_visible(node.volumes.len() == 2);
+        let balance_changed = {
+            let cmd_tx = cmd_tx.clone();
+            let channels = channels.clone();
+            let balance = balance.clone();
+            let scale = scale.clone();
+            balance_scale.connect_value_changed(move |b| {
+                let new_balance = b.value() as f32;
+                balance.set(new_balance);
+                let linear = volume::perceptual_to_linear(scale.value() as f32);
+                let volumes = balance_to_volumes(linear, new_balance, channels.get());
                 let _ = cmd_tx.send(Command::SetVolume { node_id, volumes });
             })
         };
@@ -119,6 +151,7 @@ impl Strip {
         fader_row.append(&peak_meter);
         widget.append(&fader_row);
         widget.append(&volume_label);
+        widget.append(&balance_scale);
 
         let _ = cmd_tx.send(Command::WatchPeak {
             node_id,
@@ -173,6 +206,9 @@ impl Strip {
             peak_meter,
             edit_popover,
             channels,
+            balance,
+            balance_scale,
+            balance_changed,
         }
     }
 
@@ -196,6 +232,16 @@ impl Strip {
         self.scale.set_value(volume::linear_to_perceptual(node.volume()) as f64);
         self.scale.unblock_signal(&self.scale_changed);
         set_volume_label(&self.volume_label, node.volume());
+
+        let is_stereo = node.volumes.len() == 2;
+        self.balance_scale.set_visible(is_stereo);
+        if is_stereo {
+            let balance = balance_from_volumes(&node.volumes);
+            self.balance.set(balance);
+            self.balance_scale.block_signal(&self.balance_changed);
+            self.balance_scale.set_value(balance as f64);
+            self.balance_scale.unblock_signal(&self.balance_changed);
+        }
 
         self.mute_button.block_signal(&self.mute_toggled);
         self.mute_button.set_active(node.mute);
@@ -363,5 +409,80 @@ fn set_volume_label(label: &Label, linear: f32) {
         label.add_css_class("error");
     } else {
         label.remove_css_class("error");
+    }
+}
+
+/// Apply a stereo balance (-1.0 full left ..= 0.0 center ..= 1.0 full right, pavucontrol's
+/// convention: the louder channel stays at `master`, the other is attenuated) to a master linear
+/// volume. Channel counts other than 2 ignore balance entirely, matching pavucontrol, which also
+/// only exposes balance for stereo devices.
+fn balance_to_volumes(master: f32, balance: f32, channel_count: usize) -> Vec<f32> {
+    if channel_count != 2 {
+        return vec![master; channel_count];
+    }
+    if balance <= 0.0 {
+        vec![master, master * (1.0 + balance)]
+    } else {
+        vec![master * (1.0 - balance), master]
+    }
+}
+
+/// The inverse of `balance_to_volumes`: recover the balance implied by a pair of channel volumes,
+/// e.g. after an external tool (or this app's own round-tripped command) changes them. `0.0` for
+/// anything other than exactly 2 channels, or a silent (both-zero) pair.
+fn balance_from_volumes(volumes: &[f32]) -> f32 {
+    let &[left, right] = volumes else { return 0.0 };
+    if left >= right {
+        if left > 0.0 {
+            right / left - 1.0
+        } else {
+            0.0
+        }
+    } else if right > 0.0 {
+        1.0 - left / right
+    } else {
+        0.0
+    }
+}
+
+#[cfg(test)]
+mod balance_tests {
+    use super::*;
+
+    #[test]
+    fn centered_balance_is_equal_channels() {
+        assert_eq!(balance_to_volumes(0.8, 0.0, 2), vec![0.8, 0.8]);
+    }
+
+    #[test]
+    fn negative_balance_attenuates_right_channel() {
+        assert_eq!(balance_to_volumes(0.8, -0.5, 2), vec![0.8, 0.4]);
+    }
+
+    #[test]
+    fn positive_balance_attenuates_left_channel() {
+        assert_eq!(balance_to_volumes(0.8, 0.5, 2), vec![0.4, 0.8]);
+    }
+
+    #[test]
+    fn non_stereo_ignores_balance() {
+        assert_eq!(balance_to_volumes(0.8, 0.5, 1), vec![0.8]);
+        assert_eq!(balance_to_volumes(0.8, -1.0, 3), vec![0.8, 0.8, 0.8]);
+    }
+
+    #[test]
+    fn balance_round_trips_through_volumes() {
+        for balance in [-1.0_f32, -0.5, -0.25, 0.0, 0.25, 0.5, 1.0] {
+            let volumes = balance_to_volumes(0.8, balance, 2);
+            let recovered = balance_from_volumes(&volumes);
+            assert!((recovered - balance).abs() < 1e-5, "balance={balance} recovered={recovered}");
+        }
+    }
+
+    #[test]
+    fn balance_from_volumes_ignores_non_stereo_and_silence() {
+        assert_eq!(balance_from_volumes(&[0.5]), 0.0);
+        assert_eq!(balance_from_volumes(&[0.5, 0.5, 0.5]), 0.0);
+        assert_eq!(balance_from_volumes(&[0.0, 0.0]), 0.0);
     }
 }
