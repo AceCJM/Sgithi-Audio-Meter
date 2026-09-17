@@ -30,11 +30,24 @@ pub struct CanvasModel {
     hidden: HashSet<u32>,
     /// Names of nodes hidden in a previous run, consumed the same way `saved` positions are.
     hidden_by_name: HashSet<String>,
+    /// Next unused y offset per auto-layout column (see `sync()`). Must be a persistent field,
+    /// not a local recomputed every call: PipeWire discovers nodes one at a time, so `sync()` runs
+    /// once per node rather than once for the whole graph - a local `[MARGIN; 3]` re-zeroed on
+    /// every call previously placed every auto-laid-out node in a column at the same starting y,
+    /// stacking them exactly on top of each other (confirmed live: a hardware device's multiple
+    /// capture ports rendered as illegible overlapping text).
+    next_column_y: [f64; 3],
 }
 
 impl CanvasModel {
     pub fn new(saved: HashMap<String, (f64, f64)>, hidden_by_name: HashSet<String>) -> Self {
-        Self { positions: HashMap::new(), saved, hidden: HashSet::new(), hidden_by_name }
+        Self {
+            positions: HashMap::new(),
+            saved,
+            hidden: HashSet::new(),
+            hidden_by_name,
+            next_column_y: [MARGIN; 3],
+        }
     }
 
     /// Drop layout entries for nodes that no longer exist, and place any new nodes (from the
@@ -47,7 +60,6 @@ impl CanvasModel {
         let mut ids: Vec<_> = graph.nodes.keys().copied().collect();
         ids.sort_unstable();
 
-        let mut column_y = [MARGIN, MARGIN, MARGIN];
         for id in ids {
             if self.positions.contains_key(&id) {
                 continue;
@@ -69,8 +81,9 @@ impl CanvasModel {
                 1
             };
             let x = MARGIN + column as f64 * (NODE_WIDTH + COLUMN_GAP);
-            let y = column_y[column];
-            column_y[column] += self.node_height(graph, id) + ROW_GAP;
+            let height = self.node_height(graph, id);
+            let y = self.next_column_y[column];
+            self.next_column_y[column] += height + ROW_GAP;
             self.positions.insert(id, NodeLayout { x, y });
         }
     }
@@ -225,4 +238,70 @@ pub fn cubic_bezier(
     let x = mt * mt * mt * x0 + 3.0 * mt * mt * t * x1 + 3.0 * mt * t * t * x2 + t * t * t * x3;
     let y = mt * mt * mt * y0 + 3.0 * mt * mt * t * y1 + 3.0 * mt * t * t * y2 + t * t * t * y3;
     (x, y)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{Graph, NodeInfo, PortInfo};
+
+    fn add_output_node(graph: &mut Graph, id: u32, port_id: u32) {
+        graph.nodes.insert(
+            id,
+            NodeInfo {
+                id,
+                name: format!("node-{id}"),
+                description: None,
+                media_class: "Audio/Source".into(),
+                volumes: Vec::new(),
+                mute: false,
+                peak: 0.0,
+                port_type: None,
+            },
+        );
+        graph.ports.insert(
+            port_id,
+            PortInfo { id: port_id, node_id: id, name: "out".into(), direction: Direction::Output },
+        );
+    }
+
+    #[test]
+    fn incremental_sync_does_not_stack_nodes_in_the_same_column() {
+        // Mirrors real PipeWire discovery: `sync()` runs once per node as it's discovered, not
+        // once for the whole graph - a bug here (see `next_column_y`'s doc comment) previously
+        // reset the column's placement cursor on every call, stacking every node after the first
+        // in a column at the exact same position.
+        let mut graph = Graph::new();
+        let mut canvas = CanvasModel::new(HashMap::new(), HashSet::new());
+
+        add_output_node(&mut graph, 1, 10);
+        canvas.sync(&graph);
+        add_output_node(&mut graph, 2, 20);
+        canvas.sync(&graph);
+        add_output_node(&mut graph, 3, 30);
+        canvas.sync(&graph);
+
+        let (_, y1, _, _) = canvas.node_rect(&graph, 1).unwrap();
+        let (_, y2, _, _) = canvas.node_rect(&graph, 2).unwrap();
+        let (_, y3, _, _) = canvas.node_rect(&graph, 3).unwrap();
+        assert!(y2 > y1, "node 2 should be placed below node 1, got y1={y1} y2={y2}");
+        assert!(y3 > y2, "node 3 should be placed below node 2, got y2={y2} y3={y3}");
+    }
+
+    #[test]
+    fn batched_sync_matches_incremental_sync() {
+        // The bug this guards against only showed up with incremental sync(); confirm a single
+        // batched sync() (all nodes discovered before the first sync) places them identically.
+        let mut graph = Graph::new();
+        add_output_node(&mut graph, 1, 10);
+        add_output_node(&mut graph, 2, 20);
+        add_output_node(&mut graph, 3, 30);
+        let mut canvas = CanvasModel::new(HashMap::new(), HashSet::new());
+        canvas.sync(&graph);
+
+        let (_, y1, _, _) = canvas.node_rect(&graph, 1).unwrap();
+        let (_, y2, _, _) = canvas.node_rect(&graph, 2).unwrap();
+        let (_, y3, _, _) = canvas.node_rect(&graph, 3).unwrap();
+        assert!(y1 < y2 && y2 < y3);
+    }
 }
