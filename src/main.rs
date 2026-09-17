@@ -1,5 +1,6 @@
 mod model;
 mod pw;
+mod tray;
 mod ui;
 
 fn main() -> glib::ExitCode {
