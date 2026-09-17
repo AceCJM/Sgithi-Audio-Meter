@@ -4,8 +4,8 @@ use std::rc::Rc;
 use gtk::glib::SignalHandlerId;
 use gtk::prelude::*;
 use gtk::{
-    Box as GtkBox, Button, DropDown, Entry, Justification, Label, LevelBar, Orientation, Popover, Scale,
-    ToggleButton,
+    Box as GtkBox, Button, DropDown, Entry, EventControllerFocus, GestureClick, Justification, Label, LevelBar,
+    Orientation, Popover, Scale, ToggleButton,
 };
 
 use crate::model::{is_sink_like, NodeInfo};
@@ -21,7 +21,10 @@ pub struct Strip {
     name_label: Label,
     scale: Scale,
     scale_changed: SignalHandlerId,
-    volume_label: Label,
+    /// Shows the fader's value as a percentage, and doubles as manual numeric input: typing a
+    /// number and pressing Enter (or clicking away) applies it the same way dragging the fader
+    /// does - see `commit_volume_entry`.
+    volume_entry: Entry,
     mute_button: ToggleButton,
     mute_toggled: SignalHandlerId,
     default_button: Option<Button>,
@@ -39,6 +42,8 @@ pub struct Strip {
     balance: Rc<Cell<f32>>,
     balance_scale: Scale,
     balance_changed: SignalHandlerId,
+    /// Per-channel percentages implied by the current fader + balance - see `set_balance_label`.
+    balance_label: Label,
 }
 
 impl Strip {
@@ -95,22 +100,73 @@ impl Strip {
         // label instead so we can also flag over-amplification.
         scale.set_draw_value(false);
 
-        let volume_label = Label::new(None);
-        set_volume_label(&volume_label, node.volume());
+        // Double-click resets to unity gain (100%) - matches the fader's own perceptual units, so
+        // this is just `1.0` regardless of `fader_max`. Capture phase + claiming the sequence on
+        // the second press stops the Scale's own click-to-jump handling from processing that same
+        // click afterward and overriding the reset with wherever it was clicked.
+        let volume_reset = GestureClick::new();
+        volume_reset.set_propagation_phase(gtk::PropagationPhase::Capture);
+        {
+            let scale = scale.clone();
+            volume_reset.connect_pressed(move |gesture, n_press, _x, _y| {
+                if n_press == 2 {
+                    scale.set_value(1.0);
+                    gesture.set_state(gtk::EventSequenceState::Claimed);
+                }
+            });
+        }
+        scale.add_controller(volume_reset);
+
+        let volume_entry = Entry::new();
+        volume_entry.set_width_chars(5);
+        volume_entry.set_max_width_chars(5);
+        gtk::prelude::EditableExt::set_alignment(&volume_entry, 0.5);
+        volume_entry.set_tooltip_text(Some("Click to type an exact percentage"));
+        set_volume_entry(&volume_entry, node.volume());
+
+        let balance_label = Label::new(None);
 
         let scale_changed = {
             let cmd_tx = cmd_tx.clone();
             let channels = channels.clone();
-            let volume_label = volume_label.clone();
+            let volume_entry = volume_entry.clone();
             let balance = balance.clone();
+            let balance_label = balance_label.clone();
             scale.connect_value_changed(move |s| {
                 let perceptual = s.value() as f32;
                 let linear = volume::perceptual_to_linear(perceptual);
-                set_volume_label(&volume_label, linear);
+                set_volume_entry(&volume_entry, linear);
+                set_balance_label(&balance_label, linear, balance.get());
                 let volumes = balance_to_volumes(linear, balance.get(), channels.get());
                 let _ = cmd_tx.send(Command::SetVolume { node_id, volumes });
             })
         };
+
+        // Typing a number and pressing Enter, or clicking away, applies it exactly like dragging
+        // the fader to that position would (routed through the same `scale.set_value()` call, so
+        // it gets the same balance-aware command and the same display update - see `scale_changed`
+        // above). An unparseable value just redisplays the fader's current one, discarding the typo.
+        let commit_volume_entry = {
+            let scale = scale.clone();
+            Rc::new(move |entry: &Entry| {
+                let adjustment = scale.adjustment();
+                match parse_percent(&entry.text(), adjustment.lower() as f32, adjustment.upper() as f32) {
+                    Some(perceptual) => scale.set_value(perceptual as f64),
+                    None => set_volume_entry(entry, volume::perceptual_to_linear(scale.value() as f32)),
+                }
+            }) as Rc<dyn Fn(&Entry)>
+        };
+        {
+            let commit_volume_entry = commit_volume_entry.clone();
+            volume_entry.connect_activate(move |entry| commit_volume_entry(entry));
+        }
+        {
+            let commit_volume_entry = commit_volume_entry.clone();
+            let entry_for_focus = volume_entry.clone();
+            let focus = EventControllerFocus::new();
+            focus.connect_leave(move |_| commit_volume_entry(&entry_for_focus));
+            volume_entry.add_controller(focus);
+        }
 
         // Balance is only meaningful for a 2-channel node (see `balance_to_volumes`) - hidden
         // otherwise. Re-checked in `update()` too, since a node's `Strip` is often created before
@@ -119,17 +175,35 @@ impl Strip {
         balance_scale.set_value(balance.get() as f64);
         balance_scale.set_draw_value(false);
         balance_scale.set_width_request(80);
-        balance_scale.set_tooltip_text(Some("Balance"));
+        balance_scale.set_tooltip_text(Some("Balance - double-click to center"));
         balance_scale.set_visible(node.volumes.len() == 2);
+        balance_label.set_visible(node.volumes.len() == 2);
+        set_balance_label(&balance_label, node.volume(), balance.get());
+
+        let balance_reset = GestureClick::new();
+        balance_reset.set_propagation_phase(gtk::PropagationPhase::Capture);
+        {
+            let balance_scale = balance_scale.clone();
+            balance_reset.connect_pressed(move |gesture, n_press, _x, _y| {
+                if n_press == 2 {
+                    balance_scale.set_value(0.0);
+                    gesture.set_state(gtk::EventSequenceState::Claimed);
+                }
+            });
+        }
+        balance_scale.add_controller(balance_reset);
+
         let balance_changed = {
             let cmd_tx = cmd_tx.clone();
             let channels = channels.clone();
             let balance = balance.clone();
             let scale = scale.clone();
+            let balance_label = balance_label.clone();
             balance_scale.connect_value_changed(move |b| {
                 let new_balance = b.value() as f32;
                 balance.set(new_balance);
                 let linear = volume::perceptual_to_linear(scale.value() as f32);
+                set_balance_label(&balance_label, linear, new_balance);
                 let volumes = balance_to_volumes(linear, new_balance, channels.get());
                 let _ = cmd_tx.send(Command::SetVolume { node_id, volumes });
             })
@@ -150,8 +224,9 @@ impl Strip {
         fader_row.append(&scale);
         fader_row.append(&peak_meter);
         widget.append(&fader_row);
-        widget.append(&volume_label);
+        widget.append(&volume_entry);
         widget.append(&balance_scale);
+        widget.append(&balance_label);
 
         let _ = cmd_tx.send(Command::WatchPeak {
             node_id,
@@ -199,7 +274,7 @@ impl Strip {
             name_label,
             scale,
             scale_changed,
-            volume_label,
+            volume_entry,
             mute_button,
             mute_toggled,
             default_button,
@@ -209,6 +284,7 @@ impl Strip {
             balance,
             balance_scale,
             balance_changed,
+            balance_label,
         }
     }
 
@@ -231,16 +307,21 @@ impl Strip {
         self.scale.block_signal(&self.scale_changed);
         self.scale.set_value(volume::linear_to_perceptual(node.volume()) as f64);
         self.scale.unblock_signal(&self.scale_changed);
-        set_volume_label(&self.volume_label, node.volume());
+        // Don't clobber the entry while the user is actively typing a replacement value into it.
+        if !self.volume_entry.has_focus() {
+            set_volume_entry(&self.volume_entry, node.volume());
+        }
 
         let is_stereo = node.volumes.len() == 2;
         self.balance_scale.set_visible(is_stereo);
+        self.balance_label.set_visible(is_stereo);
         if is_stereo {
             let balance = balance_from_volumes(&node.volumes);
             self.balance.set(balance);
             self.balance_scale.block_signal(&self.balance_changed);
             self.balance_scale.set_value(balance as f64);
             self.balance_scale.unblock_signal(&self.balance_changed);
+            set_balance_label(&self.balance_label, node.volume(), balance);
         }
 
         self.mute_button.block_signal(&self.mute_toggled);
@@ -407,16 +488,34 @@ fn build_edit_popover(
     popover
 }
 
-/// Show a linear volume as a percentage, styled red (GTK's built-in "error" semantic class) when
-/// over 100% - mirroring pavucontrol's over-amplification warning.
-fn set_volume_label(label: &Label, linear: f32) {
+/// Show a linear volume as a percentage in the entry, styled red (GTK's built-in "error" semantic
+/// class) when over 100% - mirroring pavucontrol's over-amplification warning.
+fn set_volume_entry(entry: &Entry, linear: f32) {
     let perceptual = volume::linear_to_perceptual(linear);
-    label.set_text(&format!("{:.0}%", perceptual * 100.0));
+    entry.set_text(&format!("{:.0}%", perceptual * 100.0));
     if perceptual > 1.0 {
-        label.add_css_class("error");
+        entry.add_css_class("error");
     } else {
-        label.remove_css_class("error");
+        entry.remove_css_class("error");
     }
+}
+
+/// Parse manually-typed fader input (e.g. "120", "120%", "  87 % ") into a clamped perceptual
+/// value, or `None` if it isn't a number - the caller then leaves the fader wherever it already
+/// was rather than applying anything.
+fn parse_percent(text: &str, min: f32, max: f32) -> Option<f32> {
+    let trimmed = text.trim().trim_end_matches('%').trim();
+    let percent: f32 = trimmed.parse().ok()?;
+    Some((percent / 100.0).clamp(min, max))
+}
+
+/// Show the per-channel percentages a stereo balance implies (see `balance_to_volumes`) - e.g.
+/// "L 100% · R 60%" for a master fader at 100% panned slightly right.
+fn set_balance_label(label: &Label, master_linear: f32, balance: f32) {
+    let volumes = balance_to_volumes(master_linear, balance, 2);
+    let left = volume::linear_to_perceptual(volumes[0]) * 100.0;
+    let right = volume::linear_to_perceptual(volumes[1]) * 100.0;
+    label.set_text(&format!("L {left:.0}% \u{b7} R {right:.0}%"));
 }
 
 /// Apply a stereo balance (-1.0 full left ..= 0.0 center ..= 1.0 full right, pavucontrol's
@@ -455,6 +554,25 @@ fn balance_from_volumes(volumes: &[f32]) -> f32 {
 #[cfg(test)]
 mod balance_tests {
     use super::*;
+
+    #[test]
+    fn parse_percent_accepts_plain_and_percent_suffixed_numbers() {
+        assert_eq!(parse_percent("100", 0.0, 1.5), Some(1.0));
+        assert_eq!(parse_percent("100%", 0.0, 1.5), Some(1.0));
+        assert_eq!(parse_percent("  74 % ", 0.0, 1.5), Some(0.74));
+    }
+
+    #[test]
+    fn parse_percent_clamps_to_the_faders_range() {
+        assert_eq!(parse_percent("500", 0.0, 1.5), Some(1.5));
+        assert_eq!(parse_percent("-20", 0.0, 1.5), Some(0.0));
+    }
+
+    #[test]
+    fn parse_percent_rejects_non_numbers() {
+        assert_eq!(parse_percent("abc", 0.0, 1.5), None);
+        assert_eq!(parse_percent("", 0.0, 1.5), None);
+    }
 
     #[test]
     fn centered_balance_is_equal_channels() {
