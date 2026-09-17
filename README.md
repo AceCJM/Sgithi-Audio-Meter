@@ -33,10 +33,10 @@ On both pages, each strip has a volume fader (0-150%, cubic/perceptual scale mat
 
 ## Building and running
 
-Requires GTK4 and PipeWire development headers, plus a C compiler toolchain (for `bindgen`, used by the `pipewire`/`libspa` crates to generate FFI bindings at build time):
+Requires GTK4, libadwaita, and PipeWire development headers, plus a C compiler toolchain (for `bindgen`, used by the `pipewire`/`libspa` crates to generate FFI bindings at build time):
 
 ```sh
-sudo apt install build-essential pkg-config libgtk-4-dev libpipewire-0.3-dev libglib2.0-dev libclang-dev
+sudo apt install build-essential pkg-config libgtk-4-dev libadwaita-1-dev libpipewire-0.3-dev libglib2.0-dev libclang-dev
 ```
 
 Then:
