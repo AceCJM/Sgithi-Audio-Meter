@@ -19,6 +19,25 @@ pub struct RouteVolume {
     pub route_device: i32,
     pub volumes: Vec<f32>,
     pub mute: bool,
+    /// The route's `port.type` info key (e.g. `"mic"`, `"line"`, `"headset-mic"`), when present -
+    /// the precise signal `model::NodeInfo::is_mic_like()` prefers over its display-name
+    /// heuristic.
+    pub port_type: Option<String>,
+}
+
+/// `SPA_PARAM_ROUTE_info` is a `Struct(Int: n_items, (String: key, String: value)*)` - `n_items`
+/// counts *pairs*, not raw struct fields. Extract `port.type` if present.
+fn parse_route_info(items: &[Value]) -> Option<String> {
+    let mut pairs = items.iter();
+    pairs.next()?; // n_items count - unneeded, we just walk pairs until they run out
+    loop {
+        let (Some(key), Some(value)) = (pairs.next(), pairs.next()) else { return None };
+        if let (Value::String(key), Value::String(value)) = (key, value) {
+            if key == "port.type" {
+                return Some(value.clone());
+            }
+        }
+    }
 }
 
 /// Parse an incoming `Route` param pod (as delivered by a `Device`'s `param` event).
@@ -32,6 +51,7 @@ pub fn parse_route(pod: &Pod) -> Option<RouteVolume> {
     let mut route_device = None;
     let mut volumes = Vec::new();
     let mut mute = false;
+    let mut port_type = None;
 
     for prop in &object.properties {
         if prop.key == spa_sys::SPA_PARAM_ROUTE_index {
@@ -49,10 +69,14 @@ pub fn parse_route(pod: &Pod) -> Option<RouteVolume> {
                     mute = m;
                 }
             }
+        } else if prop.key == spa_sys::SPA_PARAM_ROUTE_info {
+            if let Value::Struct(items) = &prop.value {
+                port_type = parse_route_info(items);
+            }
         }
     }
 
-    Some(RouteVolume { index: index?, route_device: route_device?, volumes, mute })
+    Some(RouteVolume { index: index?, route_device: route_device?, volumes, mute, port_type })
 }
 
 /// Build a `Route` pod applying a volume/mute change to a specific route, for `Device::set_param`.
