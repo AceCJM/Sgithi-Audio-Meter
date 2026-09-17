@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use gtk::prelude::*;
@@ -9,6 +9,7 @@ use gtk::{
 
 use crate::model::Graph;
 use crate::pw;
+use crate::tray;
 
 use super::applications::ApplicationsPage;
 use super::devices::DevicesPage;
@@ -60,11 +61,44 @@ fn build_window(app: &Application) {
         .build();
     window.set_titlebar(Some(&header));
 
+    // Background mode: the window's own close button hides it rather than quitting (matching a
+    // typical tray-icon app), so `really_quit` distinguishes that from an actual quit requested
+    // via the tray menu, which calls `window.close()` after setting this first.
+    let really_quit = Rc::new(Cell::new(false));
     {
         let cmd_tx = cmd_tx.clone();
-        window.connect_close_request(move |_| {
-            let _ = cmd_tx.send(pw::Command::Terminate);
-            glib::Propagation::Proceed
+        let really_quit = really_quit.clone();
+        window.connect_close_request(move |win| {
+            if really_quit.get() {
+                let _ = cmd_tx.send(pw::Command::Terminate);
+                glib::Propagation::Proceed
+            } else {
+                win.set_visible(false);
+                glib::Propagation::Stop
+            }
+        });
+    }
+
+    let tray_rx = tray::spawn();
+    {
+        let window = window.clone();
+        let really_quit = really_quit.clone();
+        glib::spawn_future_local(async move {
+            while let Ok(event) = tray_rx.recv().await {
+                match event {
+                    tray::TrayEvent::ToggleWindow => {
+                        if window.is_visible() {
+                            window.set_visible(false);
+                        } else {
+                            window.present();
+                        }
+                    }
+                    tray::TrayEvent::Quit => {
+                        really_quit.set(true);
+                        window.close();
+                    }
+                }
+            }
         });
     }
 
