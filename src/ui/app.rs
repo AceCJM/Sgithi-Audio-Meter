@@ -1,11 +1,12 @@
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
-use gtk::prelude::*;
-use gtk::{
-    glib, Adjustment, Application, ApplicationWindow, Box as GtkBox, Button, HeaderBar, Label, Orientation,
-    Popover, SpinButton, Stack, StackSwitcher,
+use adw::prelude::*;
+use adw::{
+    ActionRow, Application, ApplicationWindow, HeaderBar, PreferencesDialog, PreferencesGroup, PreferencesPage,
+    SpinRow, ToolbarView, ViewStack, ViewSwitcher,
 };
+use gtk::{glib, Adjustment, Button};
 
 use crate::model::Graph;
 use crate::pw;
@@ -25,6 +26,10 @@ pub fn run() -> glib::ExitCode {
 }
 
 fn build_window(app: &Application) {
+    // "Brighter" per the user's ask - libadwaita otherwise follows the system's light/dark
+    // preference, which on this machine is dark (see the rest of the codebase's screenshots).
+    adw::StyleManager::default().set_color_scheme(adw::ColorScheme::PreferLight);
+
     let (cmd_tx, event_rx) = pw::spawn();
 
     let graph = Rc::new(RefCell::new(Graph::new()));
@@ -33,33 +38,43 @@ fn build_window(app: &Application) {
     let applications_page = ApplicationsPage::new(graph.clone(), cmd_tx.clone(), settings.clone());
     let patchbay_page = PatchbayPage::new(graph.clone(), cmd_tx.clone());
 
-    let stack = Stack::new();
-    stack.add_titled(&devices_page.widget, Some("devices"), "Devices");
-    stack.add_titled(&applications_page.widget, Some("applications"), "Applications");
-    stack.add_titled(&patchbay_page.widget, Some("patchbay"), "Patchbay");
+    let stack = ViewStack::new();
+    stack.add_titled_with_icon(&devices_page.widget, Some("devices"), "Devices", "audio-card-symbolic");
+    stack.add_titled_with_icon(
+        &applications_page.widget,
+        Some("applications"),
+        "Applications",
+        "applications-multimedia-symbolic",
+    );
+    stack.add_titled_with_icon(&patchbay_page.widget, Some("patchbay"), "Patchbay", "network-workgroup-symbolic");
 
-    let switcher = StackSwitcher::new();
+    let switcher = ViewSwitcher::new();
     switcher.set_stack(Some(&stack));
 
     let header = HeaderBar::new();
     header.set_title_widget(Some(&switcher));
-
-    let settings_button = Button::with_label("\u{2699}"); // gear
-    settings_button.add_css_class("flat");
-    settings_button.set_tooltip_text(Some("Settings"));
-    header.pack_end(&settings_button);
-    let settings_popover =
-        build_settings_popover(&settings_button, settings, devices_page.clone(), applications_page.clone());
-    settings_button.connect_clicked(move |_| settings_popover.popup());
 
     let window = ApplicationWindow::builder()
         .application(app)
         .title("Sgithi Audio Meter")
         .default_width(1000)
         .default_height(700)
-        .child(&stack)
         .build();
-    window.set_titlebar(Some(&header));
+
+    let settings_button = Button::from_icon_name("preferences-system-symbolic");
+    settings_button.set_tooltip_text(Some("Settings"));
+    header.pack_end(&settings_button);
+    let settings_dialog =
+        build_settings_dialog(settings, devices_page.clone(), applications_page.clone());
+    {
+        let window = window.clone();
+        settings_button.connect_clicked(move |_| settings_dialog.present(Some(&window)));
+    }
+
+    let toolbar_view = ToolbarView::new();
+    toolbar_view.add_top_bar(&header);
+    toolbar_view.set_content(Some(&stack));
+    window.set_content(Some(&toolbar_view));
 
     // Background mode: the window's own close button hides it rather than quitting (matching a
     // typical tray-icon app), so `really_quit` distinguishes that from an actual quit requested
@@ -133,24 +148,20 @@ fn build_window(app: &Application) {
     window.present();
 }
 
-/// Build the Settings popover anchored to the header's gear button - currently just the fader
-/// ceiling (`ui::settings::Settings::fader_max`), applied live to every strip on both mixer pages
-/// as the value changes, and persisted immediately (see `Settings::set_fader_max`).
-fn build_settings_popover(
-    button: &Button,
+/// Build the Settings dialog - an `AdwPreferencesDialog` (grouped pages rather than a flat
+/// popover, so it has somewhere to grow as more settings get added) reachable from the header's
+/// gear button. Currently one page, one group: the fader ceiling
+/// (`ui::settings::Settings::fader_max`), applied live to every strip on both mixer pages as the
+/// value changes, and persisted immediately (see `Settings::set_fader_max`).
+fn build_settings_dialog(
     settings: Rc<RefCell<Settings>>,
     devices_page: Rc<DevicesPage>,
     applications_page: Rc<ApplicationsPage>,
-) -> Popover {
-    let content = GtkBox::new(Orientation::Vertical, 6);
-    content.set_margin_top(8);
-    content.set_margin_bottom(8);
-    content.set_margin_start(8);
-    content.set_margin_end(8);
-    content.set_width_request(220);
+) -> PreferencesDialog {
+    let dialog = PreferencesDialog::builder().title("Settings").build();
+    let page = PreferencesPage::builder().title("General").icon_name("preferences-system-symbolic").build();
+    let group = PreferencesGroup::builder().title("Faders").build();
 
-    let fader_row = GtkBox::new(Orientation::Horizontal, 6);
-    fader_row.append(&Label::new(Some("Fader max %")));
     let adjustment = Adjustment::new(
         (settings.borrow().fader_max * 100.0) as f64,
         (settings::MIN_FADER_MAX * 100.0) as f64,
@@ -159,9 +170,9 @@ fn build_settings_popover(
         10.0,
         0.0,
     );
-    let spin = SpinButton::new(Some(&adjustment), 1.0, 0);
-    fader_row.append(&spin);
-    content.append(&fader_row);
+    let spin_row = SpinRow::new(Some(&adjustment), 1.0, 0);
+    spin_row.set_title("Fader max %");
+    group.add(&spin_row);
 
     let apply_fader_max = {
         let settings = settings.clone();
@@ -177,28 +188,27 @@ fn build_settings_popover(
 
     let spin_changed = {
         let apply_fader_max = apply_fader_max.clone();
-        spin.connect_value_changed(move |s| apply_fader_max(s.value()))
+        spin_row.connect_value_notify(move |s| apply_fader_max(s.value()))
     };
 
-    let reset_button = Button::with_label("Reset to default");
+    let reset_row = ActionRow::builder().title("Reset to default").activatable(true).build();
     {
-        let spin = spin.clone();
-        reset_button.connect_clicked(move |_| {
+        let spin_row = spin_row.clone();
+        reset_row.connect_activated(move |_| {
             settings.borrow_mut().reset_to_default();
             let fader_max = settings.borrow().fader_max;
             devices_page.apply_fader_max(fader_max);
             applications_page.apply_fader_max(fader_max);
-            // Blocked like `Strip::update()`: setting the spin button's value would otherwise
-            // re-emit `value-changed` and apply the (already-applied) value a second time.
-            spin.block_signal(&spin_changed);
-            spin.set_value((fader_max * 100.0) as f64);
-            spin.unblock_signal(&spin_changed);
+            // Blocked like `Strip::update()`: setting the row's value would otherwise re-emit
+            // `changed` and apply the (already-applied) value a second time.
+            spin_row.block_signal(&spin_changed);
+            spin_row.set_value((fader_max * 100.0) as f64);
+            spin_row.unblock_signal(&spin_changed);
         });
     }
-    content.append(&reset_button);
+    group.add(&reset_row);
 
-    let popover = Popover::new();
-    popover.set_child(Some(&content));
-    popover.set_parent(button);
-    popover
+    page.add(&group);
+    dialog.add(&page);
+    dialog
 }
