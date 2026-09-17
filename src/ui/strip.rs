@@ -255,6 +255,13 @@ impl Strip {
         self.peak_meter.set_value(node.peak.min(1.0) as f64);
     }
 
+    /// The name currently shown on the strip - for the search/filter box (`ui::devices::page`,
+    /// `ui::applications::page`) to match against, rather than needing its own separate copy of
+    /// what's effectively already display state.
+    pub fn display_name(&self) -> String {
+        self.name_label.text().to_string()
+    }
+
     /// Apply a new fader ceiling from the Settings popover (`ui::settings::Settings::fader_max`).
     /// Signal-blocked like `update()`: lowering the ceiling below the fader's current displayed
     /// value clamps it, which - unblocked - would re-emit `value-changed` and send a real

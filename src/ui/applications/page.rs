@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use gtk::prelude::*;
-use gtk::{Box as GtkBox, FlowBox, Label, Orientation, ScrolledWindow, Separator, SelectionMode};
+use gtk::{Box as GtkBox, FlowBox, Label, Orientation, ScrolledWindow, SearchEntry, Separator, SelectionMode};
 
 use crate::model::{Graph, MixerGroup, NodeInfo};
 use crate::pw::Command;
@@ -66,7 +66,12 @@ pub struct ApplicationsPage {
     settings: Rc<RefCell<Settings>>,
     playback_box: FlowBox,
     recording_box: FlowBox,
-    strips: RefCell<HashMap<u32, (Strip, Placement)>>,
+    /// `Rc`-wrapped (unlike most of this struct's other fields, which are only ever accessed via
+    /// `&self`) so the search entry's `connect_search_changed` handler, wired up in `new()` before
+    /// any `Rc<Self>` exists, can share it directly - see `apply_filter`.
+    strips: Rc<RefCell<HashMap<u32, (Strip, Placement)>>>,
+    /// Current search/filter text (lowercased), applied by `apply_filter`.
+    filter: Rc<RefCell<String>>,
     cmd_tx: pipewire::channel::Sender<Command>,
 }
 
@@ -76,18 +81,37 @@ impl ApplicationsPage {
         cmd_tx: pipewire::channel::Sender<Command>,
         settings: Rc<RefCell<Settings>>,
     ) -> Rc<Self> {
-        let widget = GtkBox::new(Orientation::Horizontal, 12);
+        let widget = GtkBox::new(Orientation::Vertical, 6);
         widget.set_margin_top(12);
         widget.set_margin_bottom(12);
         widget.set_margin_start(12);
         widget.set_margin_end(12);
 
+        let strips: Rc<RefCell<HashMap<u32, (Strip, Placement)>>> = Rc::new(RefCell::new(HashMap::new()));
+        let filter = Rc::new(RefCell::new(String::new()));
+
+        let search_entry = SearchEntry::new();
+        search_entry.set_placeholder_text(Some("Filter streams..."));
+        {
+            let strips = strips.clone();
+            let filter = filter.clone();
+            search_entry.connect_search_changed(move |entry| {
+                *filter.borrow_mut() = entry.text().to_lowercase();
+                apply_filter(&strips.borrow(), &filter.borrow());
+            });
+        }
+        widget.append(&search_entry);
+
+        let columns = GtkBox::new(Orientation::Horizontal, 12);
+        columns.set_vexpand(true);
+        widget.append(&columns);
+
         let (playback_col, playback_box) = make_column("Playback");
         let (recording_col, recording_box) = make_column("Recording");
 
-        widget.append(&playback_col);
-        widget.append(&Separator::new(Orientation::Vertical));
-        widget.append(&recording_col);
+        columns.append(&playback_col);
+        columns.append(&Separator::new(Orientation::Vertical));
+        columns.append(&recording_col);
 
         Rc::new(Self {
             widget,
@@ -96,7 +120,8 @@ impl ApplicationsPage {
             settings,
             playback_box,
             recording_box,
-            strips: RefCell::new(HashMap::new()),
+            strips,
+            filter,
             cmd_tx,
         })
     }
@@ -146,6 +171,8 @@ impl ApplicationsPage {
             self.flow_box_for(placement).insert(&strip.widget, -1);
             strips.insert(node.id, (strip, placement));
         }
+
+        apply_filter(&strips, &self.filter.borrow());
     }
 
     /// Fast path for `Event::PeakLevel`, called directly by `ui::app`'s event loop instead of
@@ -162,5 +189,14 @@ impl ApplicationsPage {
         for (strip, _) in self.strips.borrow().values() {
             strip.set_fader_max(fader_max);
         }
+    }
+}
+
+/// Show only the strips whose display name matches `filter` (a lowercased substring match, empty
+/// meaning "show everything") - called both live as the search entry's text changes and at the
+/// end of every `sync()`, so a rename/graph change can't leave a strip's visibility stale.
+fn apply_filter(strips: &HashMap<u32, (Strip, Placement)>, filter: &str) {
+    for (strip, _) in strips.values() {
+        strip.widget.set_visible(filter.is_empty() || strip.display_name().to_lowercase().contains(filter));
     }
 }
