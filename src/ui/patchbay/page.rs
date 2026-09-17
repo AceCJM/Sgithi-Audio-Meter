@@ -2,7 +2,10 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use gtk::prelude::*;
-use gtk::{gdk, Box as GtkBox, Button, DrawingArea, EventControllerMotion, GestureClick, GestureDrag, Orientation, Popover, ScrolledWindow};
+use gtk::{
+    gdk, Box as GtkBox, Button, DrawingArea, EventControllerMotion, EventControllerScroll, EventControllerScrollFlags,
+    GestureClick, GestureDrag, Orientation, Popover, ScrolledWindow,
+};
 
 use crate::model::{Direction, Graph};
 use crate::pw::Command;
@@ -10,6 +13,10 @@ use crate::pw::Command;
 use super::canvas_model::CanvasModel;
 use super::persistence;
 use super::render;
+
+const MIN_ZOOM: f64 = 0.25;
+const MAX_ZOOM: f64 = 3.0;
+const ZOOM_STEP: f64 = 1.1;
 
 /// What a left-button drag on the canvas is currently doing, decided by what was under the
 /// pointer when the drag started.
@@ -24,6 +31,11 @@ pub struct PatchbayPage {
     drawing_area: DrawingArea,
     graph: Rc<RefCell<Graph>>,
     canvas: Rc<RefCell<CanvasModel>>,
+    /// Canvas zoom factor - `render::draw` scales the whole `cairo::Context` by this before
+    /// drawing, so every hit-testing/drag coordinate coming from a `DrawingArea` input event
+    /// (always in real widget pixels) must be divided by it to get back to `CanvasModel`'s
+    /// logical coordinate space. Changed via Ctrl+scroll - see `new()`.
+    zoom: Rc<Cell<f64>>,
 }
 
 impl PatchbayPage {
@@ -31,6 +43,7 @@ impl PatchbayPage {
         let canvas = Rc::new(RefCell::new(CanvasModel::new(persistence::load(), persistence::load_hidden())));
         let drag = Rc::new(RefCell::new(DragState::None));
         let hover_link: Rc<Cell<Option<u32>>> = Rc::new(Cell::new(None));
+        let zoom = Rc::new(Cell::new(1.0_f64));
 
         let drawing_area = DrawingArea::new();
         drawing_area.set_content_width(900);
@@ -41,7 +54,9 @@ impl PatchbayPage {
             let canvas = canvas.clone();
             let drag = drag.clone();
             let hover_link = hover_link.clone();
+            let zoom = zoom.clone();
             drawing_area.set_draw_func(move |_area, cr, _w, _h| {
+                cr.scale(zoom.get(), zoom.get());
                 render::draw(cr, &graph.borrow(), &canvas.borrow(), &drag.borrow(), hover_link.get());
             });
         }
@@ -52,13 +67,20 @@ impl PatchbayPage {
             let canvas = canvas.clone();
             let drag = drag.clone();
             let drawing_area = drawing_area.clone();
+            let zoom = zoom.clone();
             drag_gesture.connect_drag_begin(move |_gesture, x, y| {
+                // Gesture coordinates are real widget pixels; `CanvasModel` and `DragState` work
+                // in the unzoomed logical space `render::draw` scales up from - see `zoom`'s doc
+                // comment on `PatchbayPage`.
+                let (lx, ly) = (x / zoom.get(), y / zoom.get());
                 let g = graph.borrow();
                 let c = canvas.borrow();
                 let mut state = drag.borrow_mut();
-                *state = if let Some(port_id) = c.port_at(&g, x, y) {
-                    DragState::DrawingLink { from_port: port_id, cur_x: x, cur_y: y }
-                } else if let Some(node_id) = c.node_at(&g, x, y) {
+                *state = if let Some(port_id) = c.port_at(&g, lx, ly) {
+                    DragState::DrawingLink { from_port: port_id, cur_x: lx, cur_y: ly }
+                } else if let Some(node_id) = c.node_at(&g, lx, ly) {
+                    // Kept in raw widget pixels (not logical) since it's only ever differenced
+                    // against another raw widget-pixel point in `connect_drag_update` below.
                     DragState::MovingNode { id: node_id, last_x: x, last_y: y }
                 } else {
                     DragState::None
@@ -73,19 +95,22 @@ impl PatchbayPage {
             let canvas = canvas.clone();
             let drag = drag.clone();
             let drawing_area = drawing_area.clone();
+            let zoom = zoom.clone();
             drag_gesture.connect_drag_update(move |gesture, offset_x, offset_y| {
                 let (start_x, start_y) = gesture.start_point().unwrap_or((0.0, 0.0));
                 let mut state = drag.borrow_mut();
                 match &mut *state {
                     DragState::MovingNode { id, last_x, last_y } => {
                         let (cur_x, cur_y) = (start_x + offset_x, start_y + offset_y);
-                        canvas.borrow_mut().move_node(*id, cur_x - *last_x, cur_y - *last_y);
+                        let z = zoom.get();
+                        canvas.borrow_mut().move_node(*id, (cur_x - *last_x) / z, (cur_y - *last_y) / z);
                         *last_x = cur_x;
                         *last_y = cur_y;
                     }
                     DragState::DrawingLink { cur_x, cur_y, .. } => {
-                        *cur_x = start_x + offset_x;
-                        *cur_y = start_y + offset_y;
+                        let z = zoom.get();
+                        *cur_x = (start_x + offset_x) / z;
+                        *cur_y = (start_y + offset_y) / z;
                     }
                     DragState::None => {}
                 }
@@ -99,12 +124,14 @@ impl PatchbayPage {
             let drag = drag.clone();
             let drawing_area = drawing_area.clone();
             let cmd_tx = cmd_tx.clone();
+            let zoom = zoom.clone();
             drag_gesture.connect_drag_end(move |gesture, offset_x, offset_y| {
                 let (start_x, start_y) = gesture.start_point().unwrap_or((0.0, 0.0));
                 let mut state = drag.borrow_mut();
                 match &*state {
                     DragState::DrawingLink { from_port, .. } => {
-                        let (end_x, end_y) = (start_x + offset_x, start_y + offset_y);
+                        let z = zoom.get();
+                        let (end_x, end_y) = ((start_x + offset_x) / z, (start_y + offset_y) / z);
                         let g = graph.borrow();
                         let c = canvas.borrow();
                         if let Some(to_port) = c.port_at(&g, end_x, end_y) {
@@ -132,11 +159,15 @@ impl PatchbayPage {
             let canvas = canvas.clone();
             let drawing_area = drawing_area.clone();
             let cmd_tx = cmd_tx.clone();
+            let zoom = zoom.clone();
             click_gesture.connect_pressed(move |_gesture, _n, x, y| {
+                // Hit-testing needs logical coordinates, but the popover is positioned in the
+                // `DrawingArea`'s own (real widget-pixel) space, so `x, y` themselves stay as-is.
+                let (lx, ly) = (x / zoom.get(), y / zoom.get());
                 let hit = {
                     let g = graph.borrow();
                     let c = canvas.borrow();
-                    c.node_at(&g, x, y).map(Hit::Node).or_else(|| c.link_at(&g, x, y).map(Hit::Link))
+                    c.node_at(&g, lx, ly).map(Hit::Node).or_else(|| c.link_at(&g, lx, ly).map(Hit::Link))
                 };
                 match hit {
                     Some(Hit::Node(node_id)) => show_node_menu(&drawing_area, x, y, node_id, &canvas, &graph),
@@ -157,8 +188,10 @@ impl PatchbayPage {
             let canvas = canvas.clone();
             let hover_link = hover_link.clone();
             let drawing_area = drawing_area.clone();
+            let zoom = zoom.clone();
             motion.connect_motion(move |_c, x, y| {
-                let found = canvas.borrow().link_at(&graph.borrow(), x, y);
+                let (lx, ly) = (x / zoom.get(), y / zoom.get());
+                let found = canvas.borrow().link_at(&graph.borrow(), lx, ly);
                 if found != hover_link.get() {
                     hover_link.set(found);
                     drawing_area.queue_draw();
@@ -167,12 +200,36 @@ impl PatchbayPage {
         }
         drawing_area.add_controller(motion);
 
+        // Ctrl+scroll zooms the canvas; a plain scroll is left alone (Propagation::Proceed) so
+        // the ScrolledWindow's own scrollbars keep panning normally.
+        let scroll = EventControllerScroll::new(EventControllerScrollFlags::VERTICAL);
+        {
+            let graph = graph.clone();
+            let canvas = canvas.clone();
+            let drawing_area = drawing_area.clone();
+            let zoom = zoom.clone();
+            scroll.connect_scroll(move |controller, _dx, dy| {
+                if !controller.current_event_state().contains(gdk::ModifierType::CONTROL_MASK) {
+                    return glib::Propagation::Proceed;
+                }
+                let factor = if dy < 0.0 { ZOOM_STEP } else { 1.0 / ZOOM_STEP };
+                let new_zoom = (zoom.get() * factor).clamp(MIN_ZOOM, MAX_ZOOM);
+                zoom.set(new_zoom);
+                let (w, h) = content_size(&graph.borrow(), &canvas.borrow(), new_zoom);
+                drawing_area.set_content_width(w);
+                drawing_area.set_content_height(h);
+                drawing_area.queue_draw();
+                glib::Propagation::Stop
+            });
+        }
+        drawing_area.add_controller(scroll);
+
         let widget = ScrolledWindow::new();
         widget.set_child(Some(&drawing_area));
         widget.set_vexpand(true);
         widget.set_hexpand(true);
 
-        Rc::new(Self { widget, drawing_area, graph, canvas })
+        Rc::new(Self { widget, drawing_area, graph, canvas, zoom })
     }
 
     /// Re-layout for any new/removed nodes and repaint. Called after every graph-changing event.
@@ -181,12 +238,21 @@ impl PatchbayPage {
             let g = self.graph.borrow();
             let mut c = self.canvas.borrow_mut();
             c.sync(&g);
-            c.extent(&g)
+            content_size(&g, &c, self.zoom.get())
         };
-        self.drawing_area.set_content_width(w.max(900.0) as i32);
-        self.drawing_area.set_content_height(h.max(700.0) as i32);
+        self.drawing_area.set_content_width(w);
+        self.drawing_area.set_content_height(h);
         self.drawing_area.queue_draw();
     }
+}
+
+/// The `DrawingArea`'s required content size for a given zoom level - the logical extent
+/// (`CanvasModel::extent`, already floored to a sane minimum) scaled up the same way
+/// `render::draw` scales the `cairo::Context`, so the `ScrolledWindow`'s scrollbars match what's
+/// actually drawn.
+fn content_size(graph: &Graph, canvas: &CanvasModel, zoom: f64) -> (i32, i32) {
+    let (w, h) = canvas.extent(graph);
+    ((w.max(900.0) * zoom) as i32, (h.max(700.0) * zoom) as i32)
 }
 
 enum Hit {
