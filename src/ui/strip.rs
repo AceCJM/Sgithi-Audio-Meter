@@ -47,6 +47,7 @@ impl Strip {
         cmd_tx: pipewire::channel::Sender<Command>,
         overrides: Rc<RefCell<Overrides>>,
         resync: Rc<dyn Fn()>,
+        fader_max: f32,
     ) -> Self {
         let node_id = node.id;
         let channels = Rc::new(Cell::new(node.volumes.len().max(1)));
@@ -75,8 +76,9 @@ impl Strip {
         let edit_popover = build_edit_popover(&edit_button, &name_label, node, overrides, resync);
 
         // The fader works in perceptual (cubic) units, not the linear amplitude PipeWire sends
-        // over the wire - see `ui::volume`. Range 0.0-1.5 matches pavucontrol's 0%-150%.
-        let scale = Scale::with_range(Orientation::Vertical, 0.0, 1.5, 0.01);
+        // over the wire - see `ui::volume`. `fader_max` defaults to 1.5 (pavucontrol's 150%
+        // ceiling) but is user-configurable via the Settings popover - see `ui::settings`.
+        let scale = Scale::with_range(Orientation::Vertical, 0.0, fader_max as f64, 0.01);
         scale.set_inverted(true);
         scale.set_value(volume::linear_to_perceptual(node.volume()) as f64);
         scale.set_vexpand(true);
@@ -205,6 +207,18 @@ impl Strip {
         }
 
         self.peak_meter.set_value(node.peak.min(1.0) as f64);
+    }
+
+    /// Apply a new fader ceiling from the Settings popover (`ui::settings::Settings::fader_max`).
+    /// Signal-blocked like `update()`: lowering the ceiling below the fader's current displayed
+    /// value clamps it, which - unblocked - would re-emit `value-changed` and send a real
+    /// `SetVolume` command for a change the user never made.
+    pub fn set_fader_max(&self, fader_max: f32) {
+        let current = self.scale.value();
+        self.scale.block_signal(&self.scale_changed);
+        self.scale.set_range(0.0, fader_max as f64);
+        self.scale.set_value(current);
+        self.scale.unblock_signal(&self.scale_changed);
     }
 
     /// Update just the peak meter, bypassing everything else `update()` touches. `Event::PeakLevel`

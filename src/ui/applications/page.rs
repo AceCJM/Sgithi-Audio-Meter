@@ -8,6 +8,7 @@ use gtk::{Box as GtkBox, FlowBox, Label, Orientation, ScrolledWindow, Separator,
 use crate::model::{Graph, MixerGroup, NodeInfo};
 use crate::pw::Command;
 use crate::ui::overrides::Overrides;
+use crate::ui::settings::Settings;
 use crate::ui::strip::Strip;
 
 /// Which column a strip currently lives in - tracked per strip (rather than re-derived from
@@ -62,6 +63,7 @@ pub struct ApplicationsPage {
     pub widget: GtkBox,
     graph: Rc<RefCell<Graph>>,
     overrides: Rc<RefCell<Overrides>>,
+    settings: Rc<RefCell<Settings>>,
     playback_box: FlowBox,
     recording_box: FlowBox,
     strips: RefCell<HashMap<u32, (Strip, Placement)>>,
@@ -69,7 +71,11 @@ pub struct ApplicationsPage {
 }
 
 impl ApplicationsPage {
-    pub fn new(graph: Rc<RefCell<Graph>>, cmd_tx: pipewire::channel::Sender<Command>) -> Rc<Self> {
+    pub fn new(
+        graph: Rc<RefCell<Graph>>,
+        cmd_tx: pipewire::channel::Sender<Command>,
+        settings: Rc<RefCell<Settings>>,
+    ) -> Rc<Self> {
         let widget = GtkBox::new(Orientation::Horizontal, 12);
         widget.set_margin_top(12);
         widget.set_margin_bottom(12);
@@ -87,6 +93,7 @@ impl ApplicationsPage {
             widget,
             graph,
             overrides: Rc::new(RefCell::new(Overrides::load())),
+            settings,
             playback_box,
             recording_box,
             strips: RefCell::new(HashMap::new()),
@@ -133,7 +140,9 @@ impl ApplicationsPage {
                 let page = self.clone();
                 Rc::new(move || page.sync()) as Rc<dyn Fn()>
             };
-            let strip = Strip::new(node, display_name, self.cmd_tx.clone(), self.overrides.clone(), resync);
+            let fader_max = self.settings.borrow().fader_max;
+            let strip =
+                Strip::new(node, display_name, self.cmd_tx.clone(), self.overrides.clone(), resync, fader_max);
             self.flow_box_for(placement).insert(&strip.widget, -1);
             strips.insert(node.id, (strip, placement));
         }
@@ -144,6 +153,14 @@ impl ApplicationsPage {
     pub fn update_peak(&self, node_id: u32, peak: f32) {
         if let Some((strip, _)) = self.strips.borrow().get(&node_id) {
             strip.set_peak(peak);
+        }
+    }
+
+    /// Apply a new fader ceiling (from the Settings popover, `ui::app`) to every strip already on
+    /// screen; newly-created strips pick up `self.settings` directly in `sync()` above.
+    pub fn apply_fader_max(&self, fader_max: f32) {
+        for (strip, _) in self.strips.borrow().values() {
+            strip.set_fader_max(fader_max);
         }
     }
 }
