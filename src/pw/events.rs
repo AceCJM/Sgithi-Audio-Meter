@@ -66,4 +66,10 @@ pub enum Event {
         id: u32,
         peak: f32,
     },
+    /// A hardware node's Route `port.type` info key resolved or changed - see
+    /// `model::NodeInfo::is_mic_like()`.
+    NodePortTypeChanged {
+        id: u32,
+        port_type: Option<String>,
+    },
 }

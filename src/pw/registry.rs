@@ -173,6 +173,10 @@ pub fn handle_global(state: &Rc<RefCell<PwState>>, obj: &pipewire::registry::Glo
                                 volumes: route.volumes.clone(),
                                 mute: route.mute,
                             });
+                            let _ = st.event_tx.send_blocking(Event::NodePortTypeChanged {
+                                id: node_id,
+                                port_type: route.port_type.clone(),
+                            });
                         }
                     }
                 })
@@ -305,6 +309,7 @@ pub fn handle_global(state: &Rc<RefCell<PwState>>, obj: &pipewire::registry::Glo
                             let key = (device_id, route.route_device);
                             let volumes = route.volumes.clone();
                             let mute = route.mute;
+                            let port_type = route.port_type.clone();
                             st.routes.insert(key, route);
 
                             let affected: Vec<u32> = st
@@ -319,6 +324,10 @@ pub fn handle_global(state: &Rc<RefCell<PwState>>, obj: &pipewire::registry::Glo
                                     id: node_id,
                                     volumes: volumes.clone(),
                                     mute,
+                                });
+                                let _ = event_tx.send_blocking(Event::NodePortTypeChanged {
+                                    id: node_id,
+                                    port_type: port_type.clone(),
                                 });
                             }
                         }

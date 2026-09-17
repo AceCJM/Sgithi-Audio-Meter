@@ -61,6 +61,9 @@ pub struct NodeInfo {
     /// Most recent linear peak sample seen by this node's metering stream (`pw::peak`), 0.0 if
     /// none has arrived yet (e.g. metering hasn't started, or nothing is playing).
     pub peak: f32,
+    /// A hardware capture node's `port.type` Route info key (e.g. `"mic"`, `"line"`,
+    /// `"headset-mic"`), when known - see `is_mic_like()`.
+    pub port_type: Option<String>,
 }
 
 impl NodeInfo {
@@ -72,20 +75,24 @@ impl NodeInfo {
         is_hardware(&self.media_class)
     }
 
-    /// Best-effort classification of a hardware `Audio/Source` as a microphone versus another
-    /// kind of capture input (line-in, a device's own monitor/loopback input, etc.).
+    /// Classification of a hardware `Audio/Source` as a microphone versus another kind of capture
+    /// input (line-in, a device's own monitor/loopback input, etc.).
     ///
-    /// PipeWire doesn't expose a reliable per-node "this is a microphone" flag - the closest
-    /// thing, `port.type` ("mic" vs "line"), lives on the `Device`'s `Route` param, not on the
-    /// Node itself (and isn't currently parsed by `device_route.rs`). This instead checks for
-    /// "mic"/"microphone" in the node's display name, which happens to track the real
-    /// distinction for the hardware this was tested against (a Focusrite Scarlett Solo: "Input 2
-    /// Mic" vs "Monitor Input 3/4", "Input 1 Inst/Line") since vendors typically name mic inputs
-    /// accordingly - but it's a heuristic, not a guarantee.
+    /// Prefers the Route's `port.type` info key (`"mic"`, `"headset-mic"`, `"line"`, ... - parsed
+    /// by `pw::device_route`, threaded onto this node via `Event::NodePortTypeChanged`), the
+    /// precise signal PipeWire itself uses. Falls back to checking for "mic"/"microphone" in the
+    /// node's display name when `port_type` isn't known yet (e.g. right after discovery, before
+    /// the owning Device's Route param has arrived) - a heuristic that happened to track the real
+    /// distinction for the hardware this was first tested against (a Focusrite Scarlett Solo:
+    /// "Input 2 Mic" vs "Monitor Input 3/4", "Input 1 Inst/Line"), but isn't a guarantee.
     pub fn is_mic_like(&self) -> bool {
-        self.is_hardware()
-            && self.media_class == "Audio/Source"
-            && self.display_name().to_lowercase().contains("mic")
+        if !self.is_hardware() || self.media_class != "Audio/Source" {
+            return false;
+        }
+        match &self.port_type {
+            Some(port_type) => port_type.contains("mic"),
+            None => self.display_name().to_lowercase().contains("mic"),
+        }
     }
 
     /// Average of the per-channel volumes, for a single-fader display.
@@ -173,6 +180,7 @@ impl Graph {
                         volumes: Vec::new(),
                         mute: false,
                         peak: 0.0,
+                        port_type: None,
                     },
                 );
             }
@@ -221,6 +229,11 @@ impl Graph {
             Event::PeakLevel { id, peak } => {
                 if let Some(node) = self.nodes.get_mut(&id) {
                     node.peak = peak;
+                }
+            }
+            Event::NodePortTypeChanged { id, port_type } => {
+                if let Some(node) = self.nodes.get_mut(&id) {
+                    node.port_type = port_type;
                 }
             }
         }
