@@ -226,6 +226,16 @@ impl DevicesPage {
         }
 
         apply_filter(&strips, &self.filter.borrow());
+
+        // A category change moves a Strip's widget out of one FlowBox and into a sibling one in
+        // the same tick (remove above, insert above) - GTK is supposed to notice each FlowBox's
+        // own size requirement changed and requeue a relayout on its own, but empirically
+        // (confirmed live: switching a node's Microphone/Other Input category) that sometimes
+        // leaves the destination section's heading `Label` and/or the moved strip's full height
+        // unmeasured until something else forces a fresh layout pass, like resizing the window.
+        // Explicitly requesting one here, rather than waiting on GTK to notice, is the same fix a
+        // manual resize provides, just without needing the user to do it.
+        self.widget.queue_resize();
     }
 
     /// Fast path for `Event::PeakLevel`, called directly by `ui::app`'s event loop instead of
