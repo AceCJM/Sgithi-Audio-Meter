@@ -72,4 +72,8 @@ pub enum Event {
         id: u32,
         port_type: Option<String>,
     },
+    /// The connection to the PipeWire daemon was lost (e.g. `pipewire`/`wireplumber` restarting).
+    /// The PipeWire thread exits after sending this - see `pw::thread`'s module doc comment for
+    /// why a live reconnect isn't attempted.
+    Disconnected,
 }

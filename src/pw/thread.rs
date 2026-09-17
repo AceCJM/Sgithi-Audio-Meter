@@ -4,8 +4,15 @@
 //! GTK thread. Instead this thread turns PipeWire callbacks into `Event`s sent over an
 //! `async_channel` to the GTK thread, and receives `Command`s from the GTK thread over a
 //! `pipewire::channel` attached to this loop.
+//!
+//! If the connection to the PipeWire daemon drops (e.g. `pipewire`/`wireplumber` restarting),
+//! this thread sends `Event::Disconnected` and exits rather than attempting a live reconnect: the
+//! `Command` `Receiver` is consumed by `Receiver::attach`, permanently tied to this thread's
+//! `MainLoopRc` - reconnecting would mean building a new channel and re-pointing every `Command`
+//! sender already cloned into every page and `Strip`, a bigger change than this pass attempts.
+//! The user needs to restart the app after a disconnect.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use super::commands::Command;
@@ -42,7 +49,7 @@ fn run(
     let core = context.connect_rc(None)?;
     let registry = core.get_registry_rc()?;
 
-    let state = Rc::new(RefCell::new(PwState::new(core.clone(), registry.clone(), event_tx)));
+    let state = Rc::new(RefCell::new(PwState::new(core.clone(), registry.clone(), event_tx.clone())));
 
     let main_loop_for_cmds = main_loop.clone();
     let state_for_cmds = state.clone();
@@ -58,7 +65,29 @@ fn run(
         .global_remove(move |id| handle_global_remove(&state_for_remove, id))
         .register();
 
+    // A core-level error (id == PW_ID_CORE) means the connection itself is gone, not just one
+    // object - e.g. the daemon restarting. Quit the loop so `run()` can report it below, instead
+    // of leaving the app silently stuck showing stale state forever.
+    let disconnected = Rc::new(Cell::new(false));
+    let _core_listener = {
+        let main_loop = main_loop.clone();
+        let disconnected = disconnected.clone();
+        core.add_listener_local()
+            .error(move |id, _seq, res, message| {
+                if id == pipewire::core::PW_ID_CORE {
+                    log::error!("pipewire core error (res={res}): {message}");
+                    disconnected.set(true);
+                    main_loop.quit();
+                }
+            })
+            .register()
+    };
+
     main_loop.run();
+
+    if disconnected.get() {
+        let _ = event_tx.send_blocking(Event::Disconnected);
+    }
 
     Ok(())
 }

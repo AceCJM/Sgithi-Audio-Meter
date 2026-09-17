@@ -236,6 +236,9 @@ impl Graph {
                     node.port_type = port_type;
                 }
             }
+            // No graph state to update - `ui::app`'s event loop reacts to this directly instead
+            // of through a page sync(), the same way it special-cases `PeakLevel`.
+            Event::Disconnected => {}
         }
     }
 

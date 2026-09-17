@@ -68,6 +68,7 @@ fn build_window(app: &Application) {
         });
     }
 
+    let window_for_events = window.clone();
     glib::spawn_future_local(async move {
         while let Ok(event) = event_rx.recv().await {
             // `PeakLevel` arrives far more often (~30Hz per watched node - see `pw::peak`) than
@@ -79,6 +80,13 @@ fn build_window(app: &Application) {
                 graph.borrow_mut().apply(pw::Event::PeakLevel { id, peak });
                 devices_page.update_peak(id, peak);
                 applications_page.update_peak(id, peak);
+                continue;
+            }
+            // The pipewire thread has exited (see `pw::thread`'s module doc comment for why this
+            // doesn't attempt a live reconnect) - say so plainly rather than leaving the mixer
+            // looking normal but silently frozen on stale state.
+            if let pw::Event::Disconnected = event {
+                window_for_events.set_title(Some("Sgithi Audio Meter (disconnected - restart to reconnect)"));
                 continue;
             }
             graph.borrow_mut().apply(event);
