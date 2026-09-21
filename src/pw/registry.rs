@@ -297,8 +297,45 @@ pub fn handle_global(state: &Rc<RefCell<PwState>>, obj: &pipewire::registry::Glo
 
             let event_tx = st.event_tx.clone();
             let state_for_param = state.clone();
+            let state_for_info = state.clone();
             let listener = device
                 .add_listener_local()
+                .info(move |info| {
+                    // Some session-manager device implementations (bluez5 in particular, for a
+                    // profile change made outside this app, e.g. a Bluetooth codec renegotiation)
+                    // don't proactively push a fresh `Route`/`EnumProfile`/`Profile` param event
+                    // the way `subscribe_params` normally delivers one - they only flag the change
+                    // via this `info` event's `PARAMS` change mask, and expect the listener to
+                    // re-enumerate. Without this, the graph's `device_active_profile`/
+                    // `device_profiles` state (and so the profile dropdown) can silently go stale
+                    // until the app is restarted and enumerates fresh at bind time.
+                    if !info.change_mask().contains(pipewire::device::DeviceChangeMask::PARAMS) {
+                        return;
+                    }
+                    let changed_ids: Vec<ParamType> = info.params().iter().map(|p| p.id()).collect();
+
+                    let mut st = state_for_info.borrow_mut();
+                    if changed_ids.contains(&ParamType::EnumProfile) {
+                        // A fresh EnumProfile enumeration is about to start - drop whatever was
+                        // accumulated last time first, or a profile that no longer exists (e.g. a
+                        // Bluetooth codec that's no longer available) would linger merged into
+                        // what's shown, since the `ParamType::EnumProfile` arm below only ever
+                        // inserts by index and never prunes on its own.
+                        st.device_profiles.remove(&device_id);
+                    }
+                    let Some(bound) = st.devices.get(&device_id) else { return };
+                    for id in changed_ids {
+                        // Bounded counts, matching the initial enum_params calls below - see the
+                        // comment there on why an unbounded count is never used in this file.
+                        let count = match id {
+                            ParamType::Route => 32,
+                            ParamType::EnumProfile => 16,
+                            ParamType::Profile => 4,
+                            _ => continue,
+                        };
+                        bound.device.enum_params(0, Some(id), 0, count);
+                    }
+                })
                 .param(move |_seq, param_type, _index, _next, param| {
                     let Some(param) = param else { return };
                     match param_type {

@@ -8,6 +8,7 @@ use gtk::{Box as GtkBox, DropDown, Label, Orientation, StringList};
 
 use crate::model::DeviceInfo;
 use crate::pw::Command;
+use crate::ui::device_profiles::DeviceProfiles;
 
 /// One "Device Name: [Profile v]" row. Only shown for devices with more than one profile to
 /// choose between - a device with a single fixed profile has nothing to select.
@@ -15,13 +16,18 @@ struct DeviceRow {
     widget: GtkBox,
     dropdown: DropDown,
     dropdown_changed: SignalHandlerId,
-    /// Maps a dropdown list position to the PipeWire profile index it represents (not
-    /// necessarily the same numbers, and not necessarily contiguous).
-    indices: Rc<RefCell<Vec<i32>>>,
+    /// Maps a dropdown list position to the profile it represents - `.0` is the PipeWire profile
+    /// index (not necessarily the same numbers as the position, and not necessarily contiguous),
+    /// `.1` its description, used as the stable key for `DeviceProfiles`.
+    options: Rc<RefCell<Vec<(i32, String)>>>,
 }
 
 impl DeviceRow {
-    fn new(device: &DeviceInfo, cmd_tx: pipewire::channel::Sender<Command>) -> Self {
+    fn new(
+        device: &DeviceInfo,
+        cmd_tx: pipewire::channel::Sender<Command>,
+        device_profiles: Rc<RefCell<DeviceProfiles>>,
+    ) -> Self {
         let device_id = device.id;
 
         let widget = GtkBox::new(Orientation::Horizontal, 6);
@@ -29,21 +35,26 @@ impl DeviceRow {
         widget.append(&label);
 
         let dropdown = DropDown::from_strings(&[]);
-        let indices: Rc<RefCell<Vec<i32>>> = Rc::new(RefCell::new(Vec::new()));
+        let options: Rc<RefCell<Vec<(i32, String)>>> = Rc::new(RefCell::new(Vec::new()));
 
         let dropdown_changed = {
-            let indices = indices.clone();
+            let options = options.clone();
+            let device_name = device.name.clone();
+            let cmd_tx = cmd_tx.clone();
+            let device_profiles = device_profiles.clone();
             dropdown.connect_selected_notify(move |d| {
                 let position = d.selected();
-                if let Some(&profile_index) = indices.borrow().get(position as usize) {
-                    let _ = cmd_tx.send(Command::SetProfile { device_id, profile_index });
+                if let Some((profile_index, description)) = options.borrow().get(position as usize) {
+                    let _ = cmd_tx.send(Command::SetProfile { device_id, profile_index: *profile_index });
+                    device_profiles.borrow_mut().set(&device_name, description);
                 }
             })
         };
         widget.append(&dropdown);
 
-        let row = Self { widget, dropdown, dropdown_changed, indices };
+        let row = Self { widget, dropdown, dropdown_changed, options };
         row.update(device);
+        row.apply_saved_profile(device, &cmd_tx, &device_profiles.borrow());
         row
     }
 
@@ -57,7 +68,33 @@ impl DeviceRow {
         self.dropdown.set_selected(selected_position.map(|p| p as u32).unwrap_or(gtk::INVALID_LIST_POSITION));
         self.dropdown.unblock_signal(&self.dropdown_changed);
 
-        *self.indices.borrow_mut() = device.profiles.iter().map(|p| p.index).collect();
+        *self.options.borrow_mut() = device.profiles.iter().map(|p| (p.index, p.description.clone())).collect();
+    }
+
+    /// On first seeing this device (a fresh row - a just-started process, or a device that just
+    /// reconnected under a new PipeWire id), reapply whatever profile the user last picked for a
+    /// device of this name, if it differs from whatever the session currently has active. A no-op
+    /// if nothing was ever saved, or the saved description isn't one of this device's profiles.
+    fn apply_saved_profile(
+        &self,
+        device: &DeviceInfo,
+        cmd_tx: &pipewire::channel::Sender<Command>,
+        device_profiles: &DeviceProfiles,
+    ) {
+        let Some(saved) = device_profiles.saved(&device.name) else { return };
+        let is_current = device
+            .active_profile
+            .and_then(|active| device.profiles.iter().find(|p| p.index == active))
+            .is_some_and(|p| p.description == saved);
+        if is_current {
+            return;
+        }
+        let Some(profile_index) =
+            self.options.borrow().iter().find(|(_, desc)| desc.as_str() == saved).map(|(idx, _)| *idx)
+        else {
+            return;
+        };
+        let _ = cmd_tx.send(Command::SetProfile { device_id: device.id, profile_index });
     }
 }
 
@@ -68,13 +105,19 @@ pub struct DevicesBar {
     pub widget: GtkBox,
     rows: RefCell<HashMap<u32, DeviceRow>>,
     cmd_tx: pipewire::channel::Sender<Command>,
+    device_profiles: Rc<RefCell<DeviceProfiles>>,
 }
 
 impl DevicesBar {
     pub fn new(cmd_tx: pipewire::channel::Sender<Command>) -> Rc<Self> {
         let widget = GtkBox::new(Orientation::Horizontal, 16);
         widget.set_margin_bottom(8);
-        Rc::new(Self { widget, rows: RefCell::new(HashMap::new()), cmd_tx })
+        Rc::new(Self {
+            widget,
+            rows: RefCell::new(HashMap::new()),
+            cmd_tx,
+            device_profiles: Rc::new(RefCell::new(DeviceProfiles::load())),
+        })
     }
 
     pub fn sync(&self, devices: &HashMap<u32, DeviceInfo>) {
@@ -98,7 +141,7 @@ impl DevicesBar {
                 row.update(device);
                 continue;
             }
-            let row = DeviceRow::new(device, self.cmd_tx.clone());
+            let row = DeviceRow::new(device, self.cmd_tx.clone(), self.device_profiles.clone());
             self.widget.append(&row.widget);
             rows.insert(device.id, row);
         }
